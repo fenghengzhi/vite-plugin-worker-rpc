@@ -48,7 +48,7 @@ import { add } from './compute.rpc'
 console.log(await add(1, 2)) // 3
 ```
 
-The first call starts a Worker. By default, all exports from the same module share an automatically sized Worker pool; each Worker has its own module state. Importing alone does not start one. Synchronous computation inside an `async` export still runs on the Worker thread. Use `?pool=1` when calls must share one Worker and its module state.
+The first call starts a Worker. With the default configuration, all exports from the same module share an automatically sized Worker pool; each Worker has its own module state. Importing alone does not start one. Synchronous computation inside an `async` export still runs on the Worker thread. Use `?pool=1` when calls must share one Worker and its module state, or set the project's default with `workerRpc({ pool: 1 })`.
 
 ## Worker pools
 
@@ -64,12 +64,15 @@ const results = await Promise.all([
 ])
 ```
 
+Set `pool` in the Vite plugin options to choose the project default. The precedence is **import query > plugin option > `'auto'`**. Imports without a query use the configured mode; an explicit query overrides it. See [Options](#options) for a complete Vite configuration.
+
 TypeScript query imports need an explicit module declaration; see [TypeScript](#typescript).
 
 | Import | Maximum Workers in the pool |
 | --- | --- |
-| `./compute.rpc` or `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`; falls back to `4` if the hardware value is missing or is not a positive safe integer. These imports share the default pool. |
-| `./compute.rpc?pool=1` | One shared Worker, in a pool separate from the default. |
+| `./compute.rpc` | The plugin's `pool` option, or `'auto'` when omitted. |
+| `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`; falls back to `4` if the hardware value is missing or is not a positive safe integer. |
+| `./compute.rpc?pool=1` | One shared Worker. |
 | `./compute.rpc?pool=N` | A positive safe integer `N`. |
 | `./compute.rpc?pool=unlimited` | No fixed maximum. |
 
@@ -77,13 +80,11 @@ Pools grow lazily: each call first reuses an idle Worker, then creates a Worker 
 
 `auto` reads the hardware value on the pool's first call, then keeps that maximum. It has no additional fixed cap. `unlimited` reuses idle Workers too; a busy pool can grow without a fixed bound and retains its peak Worker count until disposal or a page reload.
 
-Pool identity is the resolved source module plus its canonical pool mode. Imports from different files or through aliases share a pool when they resolve to the same source and mode. The unqueried import and `pool=auto` share a pool. Explicit numeric modes, including `pool=1`, use separate pools: `auto` stays separate from a numeric mode even when their maxima happen to match. Limits apply per module and mode, not as a global CPU budget for the application.
-
-Migration: to preserve the previous single-Worker behavior of an unqueried import, add `?pool=1` to its import path.
+Pool identity is the resolved source module plus its final pool mode. Imports from different files or through aliases share a pool when they resolve to the same source and mode. With `workerRpc({ pool: 2 })`, `./compute.rpc` and `./compute.rpc?pool=2` share a pool, while `./compute.rpc?pool=auto` has a separate pool, even when `auto` calculates a maximum of `2`. With no configured default, the unqueried import and `pool=auto` share a pool. Each source module has its own pools; the project option sets their default mode, not a global pool or CPU budget for the application.
 
 Every Worker has its own module state. Calls may move between Workers in a pool, so do not rely on a module-level counter, cache, or mutable variable being shared across all calls. A timeout rejects the caller but does not stop the request or make its Worker idle before the actual response arrives.
 
-Numeric values must use decimal digits without leading zeros, from `1` to `Number.MAX_SAFE_INTEGER`. Invalid values such as `0`, `01`, negative numbers, fractions, duplicate `pool` parameters, and unsupported query parameters produce errors. Vite's `?raw`, `?url`, and `?worker` imports retain their normal meanings; they cannot be combined with `pool`.
+Numeric query values must use decimal digits without leading zeros, from `1` to `Number.MAX_SAFE_INTEGER`. Invalid query values such as `0`, `01`, negative numbers, fractions, duplicate `pool` parameters, and unsupported query parameters produce errors. Vite's `?raw`, `?url`, and `?worker` imports retain their normal meanings; they cannot be combined with `pool`.
 
 ## Filename convention
 
@@ -165,17 +166,29 @@ Implementation imports execute in the Worker. A local RPC module reached from an
 | --- | --- | --- |
 | `include` | `**/*.rpc.{ts,js,mts,mjs}` | Files transformed into RPC modules. |
 | `exclude` | `**/node_modules/**` | Files left unchanged. |
-| `timeoutMs` | `30000` | Per-call timeout in milliseconds; `0` disables it. |
+| `pool` | `'auto'` | Default pool mode for imports without a query: a positive safe integer, `'auto'`, or `'unlimited'`. |
+| `timeoutMs` | `0` | Per-call timeout in milliseconds; `0` disables it. |
 
-`include` and `exclude` accept a glob string, regular expression, or array of either, using `@rollup/pluginutils` filtering. Relative globs resolve from Vite's project root. Supplied values replace their respective defaults. `timeoutMs` must be an integer from `0` to `2147483647`.
+`include` and `exclude` accept a glob string, regular expression, or array of either, using `@rollup/pluginutils` filtering. Relative globs resolve from Vite's project root. Supplied values replace their respective defaults. A numeric `pool` option must be a number, such as `4`, rather than the string `'4'`. `timeoutMs` must be an integer from `0` to `2147483647`.
 
 ```ts
-workerRpc({
-  include: 'src/computation/**/*.rpc.ts',
-  exclude: ['**/node_modules/**', '**/*.test.rpc.ts'],
-  timeoutMs: 60_000,
+// vite.config.ts
+import { defineConfig } from 'vite'
+import workerRpc from 'vite-plugin-worker-rpc'
+
+export default defineConfig({
+  plugins: [
+    workerRpc({
+      include: 'src/computation/**/*.rpc.ts',
+      exclude: ['**/node_modules/**', '**/*.test.rpc.ts'],
+      pool: 4, // Each module defaults to a pool of up to four Workers.
+      timeoutMs: 60_000, // Optional: enable a 60-second timeout.
+    }),
+  ],
 })
 ```
+
+**Migrating to 0.3.0:** calls no longer time out by default. Set `timeoutMs: 30_000` to keep the previous 30-second timeout. The default pool mode remains `'auto'`; set `pool: 1` if unqueried imports should use one Worker per module.
 
 ## Runtime behavior and limits
 

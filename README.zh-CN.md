@@ -48,7 +48,7 @@ import { add } from './compute.rpc'
 console.log(await add(1, 2)) // 3
 ```
 
-第一次调用时才会创建 Worker。默认情况下，同一个模块的所有导出共享一个自动决定上限的 Worker 池，每个 Worker 拥有独立的模块状态。仅导入模块不会创建 Worker。`async` 函数内部的同步计算仍然在 Worker 线程执行。如果调用必须共享一个 Worker 和模块状态，请使用 `?pool=1`。
+第一次调用时才会创建 Worker。默认配置下，同一个模块的所有导出共享一个自动决定上限的 Worker 池，每个 Worker 拥有独立的模块状态。仅导入模块不会创建 Worker。`async` 函数内部的同步计算仍然在 Worker 线程执行。如果调用必须共享一个 Worker 和模块状态，请使用 `?pool=1`，也可以通过 `workerRpc({ pool: 1 })` 设置项目默认值。
 
 ## Worker 池
 
@@ -64,12 +64,15 @@ const results = await Promise.all([
 ])
 ```
 
+在 Vite 插件配置中设置 `pool`，即可指定项目默认值。优先级为 **import query > 插件配置 > `'auto'`**。无 query 的导入使用配置中的模式，显式 query 会覆盖它。完整的 Vite 配置示例见[配置](#配置)。
+
 TypeScript 中带 query 的导入需要显式模块声明，详见 [TypeScript 类型](#typescript-类型)。
 
 | 导入方式 | 池内 Worker 数量上限 |
 | --- | --- |
-| `./compute.rpc` 或 `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`；硬件值缺失或不是大于 `0` 的安全整数时回退为 `4`。两种导入共享默认池。 |
-| `./compute.rpc?pool=1` | 一个共享 Worker，使用与默认池独立的池。 |
+| `./compute.rpc` | 使用插件的 `pool` 配置；未配置时为 `'auto'`。 |
+| `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`；硬件值缺失或不是大于 `0` 的安全整数时回退为 `4`。 |
+| `./compute.rpc?pool=1` | 一个共享 Worker。 |
 | `./compute.rpc?pool=N` | 大于 `0` 的安全整数 `N`。 |
 | `./compute.rpc?pool=unlimited` | 不设固定上限。 |
 
@@ -77,13 +80,11 @@ TypeScript 中带 query 的导入需要显式模块声明，详见 [TypeScript �
 
 `auto` 在池首次被调用时读取硬件值，之后固定这个上限，没有额外的固定最大值。`unlimited` 同样会复用空闲 Worker；池忙碌时可以持续增长，已创建的 Worker 会保留到池被释放或页面重新加载，不会在空闲时自动缩减。
 
-池的身份由解析后的源模块和规范化后的池模式共同决定。不同文件中的导入、路径别名，只要解析到相同源模块和相同模式，就共享一个池。无 query 的导入与 `pool=auto` 共用一个池。包括 `pool=1` 在内的显式数值模式使用独立的池：即使 `auto` 算出的上限恰好等于某个显式数值，两者也不会合并。上限作用于每个模块的每种模式，不是整个应用的全局 CPU 预算。
-
-迁移提示：如果需要保留之前无 query 导入时的单 Worker 行为，请在导入路径后添加 `?pool=1`。
+池的身份由解析后的源模块和最终池模式共同决定。不同文件中的导入、路径别名，只要解析到相同源模块和相同模式，就共享一个池。配置 `workerRpc({ pool: 2 })` 后，`./compute.rpc` 与 `./compute.rpc?pool=2` 共用一个池，`./compute.rpc?pool=auto` 则使用独立的池，即使 `auto` 算出的上限恰好也是 `2`。未配置默认值时，无 query 的导入与 `pool=auto` 共用一个池。每个源模块都有自己的池；项目配置设置的是它们的默认模式，不会创建整个应用共用的全局池，也不是全局 CPU 预算。
 
 每个 Worker 都有独立的模块状态。池内的调用可能被分发到不同 Worker，因此不能假设模块级计数器、缓存或可变变量在全部调用间共享。超时会拒绝调用者的 Promise，但不会停止请求，也不会在实际响应到达前把对应 Worker 当作空闲。
 
-数值必须是没有前导零的十进制数字，范围为 `1` 到 `Number.MAX_SAFE_INTEGER`。`0`、`01`、负数、小数、重复的 `pool` 参数和不支持的 query 参数都会报错。Vite 的 `?raw`、`?url`、`?worker` 导入保留原有含义，不能与 `pool` 混用。
+query 中的数值必须是没有前导零的十进制数字，范围为 `1` 到 `Number.MAX_SAFE_INTEGER`。query 中的 `0`、`01`、负数、小数、重复的 `pool` 参数和不支持的 query 参数都会报错。Vite 的 `?raw`、`?url`、`?worker` 导入保留原有含义，不能与 `pool` 混用。
 
 ## 文件后缀的选择
 
@@ -165,17 +166,29 @@ export { triple as multiplyByThree }
 | --- | --- | --- |
 | `include` | `**/*.rpc.{ts,js,mts,mjs}` | 需要转换的模块。 |
 | `exclude` | `**/node_modules/**` | 不进行转换的模块。 |
-| `timeoutMs` | `30000` | 单次调用的超时毫秒数，`0` 表示禁用。 |
+| `pool` | `'auto'` | 无 query 导入的默认池模式：大于 `0` 的安全整数、`'auto'` 或 `'unlimited'`。 |
+| `timeoutMs` | `0` | 单次调用的超时毫秒数，`0` 表示禁用。 |
 
-`include` / `exclude` 使用 `@rollup/pluginutils` 的匹配规则，接受 glob 字符串、正则表达式，或两者组成的数组。相对 glob 以 Vite 项目根目录为基准。传入值会替换对应的默认值。`timeoutMs` 必须是 `0` 到 `2147483647` 之间的整数。
+`include` / `exclude` 使用 `@rollup/pluginutils` 的匹配规则，接受 glob 字符串、正则表达式，或两者组成的数组。相对 glob 以 Vite 项目根目录为基准。传入值会替换对应的默认值。数值型 `pool` 配置应使用 `4` 这样的 number，不能使用字符串 `'4'`。`timeoutMs` 必须是 `0` 到 `2147483647` 之间的整数。
 
 ```ts
-workerRpc({
-  include: 'src/computation/**/*.rpc.ts',
-  exclude: ['**/node_modules/**', '**/*.test.rpc.ts'],
-  timeoutMs: 60_000,
+// vite.config.ts
+import { defineConfig } from 'vite'
+import workerRpc from 'vite-plugin-worker-rpc'
+
+export default defineConfig({
+  plugins: [
+    workerRpc({
+      include: 'src/computation/**/*.rpc.ts',
+      exclude: ['**/node_modules/**', '**/*.test.rpc.ts'],
+      pool: 4, // 每个模块默认使用最多四个 Worker 的池。
+      timeoutMs: 60_000, // 可选：启用 60 秒超时。
+    }),
+  ],
 })
 ```
+
+**迁移到 0.3.0：** 调用默认不再超时。设置 `timeoutMs: 30_000` 可保留之前的 30 秒超时。默认池模式仍为 `'auto'`；如果希望无 query 的导入使用单 Worker，可以设置 `pool: 1`，每个模块各自拥有一个 Worker。
 
 ## 运行行为与限制
 

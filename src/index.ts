@@ -7,6 +7,7 @@ import { createFilter, type FilterPattern } from '@rollup/pluginutils'
 import { normalizePath, type Plugin, type ResolvedConfig } from 'vite'
 import { collectRpcExports } from './exports.js'
 import { parsePoolQuery, poolModuleId } from './pool-query.js'
+import type { RpcPoolMode } from './runtime.js'
 
 export type { RpcPoolMode } from './runtime.js'
 
@@ -15,7 +16,9 @@ export interface WorkerRpcOptions {
   include?: FilterPattern
   /** Modules to leave unchanged. Defaults to node_modules. */
   exclude?: FilterPattern
-  /** Per-call deadline in milliseconds. 0 disables it. Defaults to 30 seconds. */
+  /** Default pool mode for imports without ?pool. Defaults to auto. Each module has its own pool. */
+  pool?: RpcPoolMode
+  /** Per-call deadline in milliseconds. 0 (the default) disables it. */
   timeoutMs?: number
 }
 
@@ -44,7 +47,12 @@ export default function workerRpc(options: WorkerRpcOptions = {}): Plugin {
 
 function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
   let matches: ReturnType<typeof createFilter>
-  const timeoutMs = options.timeoutMs ?? 30_000
+  const defaultPool = options.pool === undefined ? 'auto' : options.pool
+  if (defaultPool !== 'auto' && defaultPool !== 'unlimited' &&
+      !(typeof defaultPool === 'number' && Number.isSafeInteger(defaultPool) && defaultPool > 0)) {
+    throw new TypeError('[vite-plugin-worker-rpc] pool must be a positive safe integer, "auto", or "unlimited".')
+  }
+  const timeoutMs = options.timeoutMs ?? 0
   if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647) {
     throw new TypeError('[vite-plugin-worker-rpc] timeoutMs must be an integer between 0 and 2147483647.')
   }
@@ -97,7 +105,15 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
       if (!resolved && new URLSearchParams(source.split('?')[1]).has('pool')) {
         const path = await this.resolve(cleanId(source), importer, { ...resolveOptions, skipSelf: true })
         if (path && !path.external && matches(cleanId(path.id))) {
-          resolved = { ...path, id: `${path.id}${path.id.includes('?') ? '&' : '?'}${source.slice(source.indexOf('?') + 1)}` }
+          if (isSource(path.id)) {
+            // Resolving a nested alias may already select its local Worker
+            // implementation. Validate the query without adding a second ID
+            // for the same implementation and splitting its module state.
+            parsePoolQuery(source)
+            resolved = path
+          } else {
+            resolved = { ...path, id: `${path.id}${path.id.includes('?') ? '&' : '?'}${source.slice(source.indexOf('?') + 1)}` }
+          }
         }
       }
       if (!resolved || resolved.external || !isAbsolute(cleanId(resolved.id))) return resolved
@@ -125,9 +141,9 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
         return { ...resolved, id: sourceId(filename) }
       }
       if (!matches(filename)) return resolved
-      const pool = parsePoolQuery(resolved.id)
+      const pool = parsePoolQuery(resolved.id, defaultPool)
       if (pool === null) return resolved
-      return { ...resolved, id: poolModuleId(normalizePath(await realpath(filename)), pool) }
+      return { ...resolved, id: poolModuleId(normalizePath(await realpath(filename)), pool, defaultPool) }
     },
     async transform(code, id) {
       let filename = cleanId(id)
@@ -136,7 +152,7 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
         return
       }
       if (!matches(filename) || config.isWorker) return
-      const pool = parsePoolQuery(id)
+      const pool = parsePoolQuery(id, defaultPool)
       if (pool === null) return
       const names = collectRpcExports(code, filename)
       if (!names.length) return { code: 'export {};', map: null }

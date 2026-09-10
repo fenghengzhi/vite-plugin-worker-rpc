@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { parsePoolQuery, poolModuleId } from '../src/pool-query.js'
+import workerRpc, { type RpcPoolMode } from '../src/index.js'
 
 test('recognizes pool modes and Vite internal metadata', () => {
   assert.equal(parsePoolQuery('/compute.rpc.ts'), 'auto')
@@ -17,6 +18,38 @@ test('recognizes pool modes and Vite internal metadata', () => {
 test('preserves Vite raw, URL and Worker imports', () => {
   for (const query of ['raw', 'url', 'worker', 'sharedworker', 'worker&inline', 'worker&url', 'worker_file&type=module']) {
     assert.equal(parsePoolQuery(`/compute.rpc.ts?${query}`), null)
+  }
+})
+
+test('project defaults preserve explicit overrides and canonical module identity', () => {
+  const filename = '/compute.rpc.ts'
+  const modes: RpcPoolMode[] = [1, 4, 'auto', 'unlimited']
+  for (const defaultPool of modes) {
+    assert.equal(parsePoolQuery(filename, defaultPool), defaultPool)
+    assert.equal(parsePoolQuery(`${filename}?import&t=123`, defaultPool), defaultPool)
+    assert.equal(parsePoolQuery(`${filename}?raw`, defaultPool), null)
+    for (const pool of modes) {
+      const id = poolModuleId(filename, pool, defaultPool)
+      assert.equal(id === filename, pool === defaultPool)
+      assert.equal(parsePoolQuery(`${filename}?pool=${pool}`, defaultPool), pool)
+      assert.equal(parsePoolQuery(id, defaultPool), pool, 'canonical IDs must retain explicit auto overrides')
+      assert.equal(poolModuleId(filename, parsePoolQuery(id, defaultPool)!, defaultPool), id)
+    }
+  }
+})
+
+test('validates project pool and timeout options at plugin creation', () => {
+  for (const pool of [undefined, 1, 4, Number.MAX_SAFE_INTEGER, 'auto', 'unlimited'] as const) {
+    assert.doesNotThrow(() => workerRpc({ pool }))
+  }
+  for (const pool of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null, false, '4', 'AUTO']) {
+    assert.throws(() => workerRpc({ pool: pool as RpcPoolMode }), /pool must be a positive safe integer/)
+  }
+  for (const timeoutMs of [0, 30_000, 2_147_483_647]) {
+    assert.doesNotThrow(() => workerRpc({ timeoutMs }))
+  }
+  for (const timeoutMs of [-1, 0.5, NaN, Infinity, 2_147_483_648]) {
+    assert.throws(() => workerRpc({ timeoutMs }), /timeoutMs must be an integer/)
   }
 })
 
