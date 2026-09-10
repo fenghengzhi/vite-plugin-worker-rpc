@@ -1,0 +1,99 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate and pack without publishing to npm
+        type: boolean
+        default: true
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      name: ${{ steps.metadata.outputs.name }}
+      version: ${{ steps.metadata.outputs.version }}
+      dist_tag: ${{ steps.metadata.outputs.dist_tag }}
+      exists: ${{ steps.metadata.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@12.0.2
+      - name: Check package, tag, and public registry
+        id: metadata
+        run: node scripts/release.mjs check
+
+  checks:
+    name: Run the Vite compatibility matrix
+    needs: metadata
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Pack and publish
+    needs: [metadata, checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PACKAGE_NAME: ${{ needs.metadata.outputs.name }}
+      PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+      DIST_TAG: ${{ needs.metadata.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@12.0.2
+      - run: npm ci
+      - run: npm run build
+      - name: Pack and verify the release tarball
+        id: package
+        run: node scripts/release.mjs pack
+      - name: Validate publishing without uploading
+        if: env.DRY_RUN == 'true'
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          npm publish "$TARBALL" --dry-run --access public --tag "$DIST_TAG" --registry https://registry.npmjs.org/
+          printf '%s\n' "Dry run completed for $PACKAGE_NAME@$PACKAGE_VERSION. No package was published; npm trusted publishing was not tested." >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish with npm trusted publishing
+        if: env.DRY_RUN == 'false' && needs.metadata.outputs.exists == 'false'
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          npm publish "$TARBALL" --provenance --access public --tag "$DIST_TAG" --registry https://registry.npmjs.org/
+          printf '%s\n' "Published $PACKAGE_NAME@$PACKAGE_VERSION with dist-tag $DIST_TAG." >> "$GITHUB_STEP_SUMMARY"
+      - name: Report an already published version
+        if: env.DRY_RUN == 'false' && needs.metadata.outputs.exists == 'true'
+        run: |
+          printf '%s\n' "Skipped npm publication: $PACKAGE_NAME@$PACKAGE_VERSION already exists in the public registry." >> "$GITHUB_STEP_SUMMARY"

@@ -4,6 +4,10 @@
   "description": "Import named functions from .rpc modules and run them in Web Workers automatically.",
   "type": "module",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "author": "fenghengzhi",
   "repository": {
     "type": "git",
@@ -57,7 +61,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "test:unit": "tsx --test tests/exports.test.ts tests/runtime.test.ts tests/pool-query.test.ts tests/declarations.test.ts",
+    "test:unit": "tsx --test tests/exports.test.ts tests/runtime.test.ts tests/pool-query.test.ts tests/declarations.test.ts tests/release.test.ts",
     "test:integration": "tsx --test tests/integration.test.ts tests/pool-integration.test.ts tests/plugin-review.test.ts tests/pool-review.test.ts",
     "check": "npm run typecheck && npm run build && npm test",
     "dev": "vite playground",

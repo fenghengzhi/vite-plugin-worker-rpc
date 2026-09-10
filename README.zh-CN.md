@@ -14,13 +14,13 @@ const result = await add(1, 2)
 
 ## 安装
 
-目前尚未发布到 npm，可以直接从公开的 GitHub 仓库安装：
-
 ```sh
-npm install -D git+https://github.com/fenghengzhi/vite-plugin-worker-rpc.git
+npm install -D vite-plugin-worker-rpc
 ```
 
-Git 依赖通过 `prepare` 脚本构建。需要 Node.js `^20.19.0 || >=22.12.0`，支持 Vite 6.4、7、8。
+需要 Node.js `^20.19.0 || >=22.12.0`，支持 Vite 6.4、7、8。
+
+也可以通过 `npm install -D git+https://github.com/fenghengzhi/vite-plugin-worker-rpc.git` 直接从 GitHub 安装，Git 依赖会通过 `prepare` 脚本构建。
 
 ## 使用
 
@@ -205,6 +205,40 @@ npm run build:playground
 ```
 
 测试覆盖导出校验、RPC 传输，以及真实 Chromium Worker 中的 Vite 开发和生产流程，包括非根路径部署和开发刷新。CI 使用 Node.js 22，分别测试 Vite 6、7、8。
+
+## 发布版本
+
+[发布工作流](./.github/workflows/publish.yml)会先运行 Vite 6/7/8 测试矩阵，再进行发布。工作流在 GitHub 托管的 Ubuntu 上使用 Node.js 24 和 npm 12.0.2，通过 GitHub OIDC 使用 npm Trusted Publishing，并生成 provenance。无需配置 `NPM_TOKEN` 仓库密钥。
+
+### 一次性 npm 配置
+
+包需要先在 npm 上存在。维护者需先在仓库中使用已登录的 npm 账号手动发布初始 `0.2.0`，完成 2FA 验证，再配置可信发布者。这些步骤是自动发布的前置条件。
+
+```sh
+# 仅首次发布，在完成构建和测试后执行。
+npm publish --access public
+
+# 使用 npm 12.0.2 配置该包信任的 GitHub 工作流。
+npm trust github vite-plugin-worker-rpc \
+  --repo fenghengzhi/vite-plugin-worker-rpc \
+  --file publish.yml \
+  --allow-publish --yes
+```
+
+也可以在 npm 包设置中配置 Trusted Publisher：GitHub owner 填 `fenghengzhi`，repository 填 `vite-plugin-worker-rpc`，workflow filename 填 `publish.yml`，environment name 留空，并开启直接发布。
+
+### 发布新版本
+
+在工作区干净的 `main` 分支中递增版本，推送生成的提交和附注标签：
+
+```sh
+npm version patch # 次版本发布使用 minor
+git push origin main --follow-tags
+```
+
+推送 `v*` 标签会触发工作流。实际发布要求当前 Git ref 是标签，名称严格等于 `v` 加上 `package.json` 中的版本号，例如 `v0.2.0`。正式版本使用 `latest`，预发布版本使用 `next`；如果版本已经发布，则跳过发布。
+
+如果只想验证工作流，在 GitHub Actions 页面手动运行 `publish.yml`，选择 `main` 并保持 `dry_run` 开启（默认值）。这会运行校验和发布演练，不会发布 npm 包。手动正式发布时，选择与版本匹配的标签并关闭 `dry_run`。
 
 ## 协议
 

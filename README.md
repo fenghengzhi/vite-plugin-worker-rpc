@@ -14,13 +14,13 @@ A Vite plugin that turns named function exports from `*.rpc.ts` and `*.rpc.js` i
 
 ## Install
 
-The package is not published to npm yet. Install the public GitHub repository:
-
 ```sh
-npm install -D git+https://github.com/fenghengzhi/vite-plugin-worker-rpc.git
+npm install -D vite-plugin-worker-rpc
 ```
 
-The Git dependency builds through its `prepare` script. Requires Node.js `^20.19.0 || >=22.12.0` and Vite 6.4, 7, or 8.
+Requires Node.js `^20.19.0 || >=22.12.0` and Vite 6.4, 7, or 8.
+
+To install directly from GitHub, use `npm install -D git+https://github.com/fenghengzhi/vite-plugin-worker-rpc.git`; the Git dependency builds through its `prepare` script.
 
 ## Use
 
@@ -205,6 +205,40 @@ npm run build:playground
 ```
 
 Tests cover export validation, RPC transport behavior, and actual Chromium Workers in Vite development and production, including a non-root base path and development reloads. CI runs against Vite 6, 7, and 8 on Node.js 22.
+
+## Publishing releases
+
+[The publish workflow](./.github/workflows/publish.yml) runs the Vite 6/7/8 test matrix before publishing. It uses npm Trusted Publishing through GitHub OIDC, with provenance, on GitHub-hosted Ubuntu with Node.js 24 and npm 12.0.2. No `NPM_TOKEN` repository secret is needed.
+
+### One-time npm setup
+
+The package must first exist on npm. A maintainer needs to publish the initial `0.2.0` from the repository with an authenticated npm account and complete its 2FA prompt, then configure the trusted publisher. This setup is a prerequisite for automatic releases.
+
+```sh
+# Initial publication only, after building and testing the release.
+npm publish --access public
+
+# With npm 12.0.2, configure the package's trusted GitHub workflow.
+npm trust github vite-plugin-worker-rpc \
+  --repo fenghengzhi/vite-plugin-worker-rpc \
+  --file publish.yml \
+  --allow-publish --yes
+```
+
+Alternatively, configure the package's Trusted Publisher in npm settings: GitHub owner `fenghengzhi`, repository `vite-plugin-worker-rpc`, workflow filename `publish.yml`, leave the environment name blank, and enable direct publishing.
+
+### Release a version
+
+From a clean `main` checkout, bump the version and push the generated commit and annotated tag:
+
+```sh
+npm version patch # use minor for a minor release
+git push origin main --follow-tags
+```
+
+Pushing a `v*` tag triggers the workflow. A real publication requires the Git ref to be a tag matching `v` plus the version in `package.json`, such as `v0.2.0`. Stable versions publish under `latest`, prereleases under `next`; an already-published version is skipped.
+
+To check the workflow without publishing, run `publish.yml` manually from the GitHub Actions page, choose `main`, and keep `dry_run` enabled (the default). This runs validation and a publication dry run; it does not publish a package. For a manual real release, select the matching version tag and disable `dry_run`.
 
 ## License
 
