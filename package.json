@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-worker-rpc",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Import named functions from .rpc modules and run them in Web Workers automatically.",
   "type": "module",
   "license": "MIT",

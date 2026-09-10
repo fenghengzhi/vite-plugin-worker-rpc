@@ -188,7 +188,7 @@ export default defineConfig({
 })
 ```
 
-**迁移到 0.3.0：** 调用默认不再超时。设置 `timeoutMs: 30_000` 可保留之前的 30 秒超时。默认池模式仍为 `'auto'`；如果希望无 query 的导入使用单 Worker，可以设置 `pool: 1`，每个模块各自拥有一个 Worker。
+**迁移到 0.3.1：** 调用默认不再超时。设置 `timeoutMs: 30_000` 可保留之前的 30 秒超时。默认池模式仍为 `'auto'`；如果希望无 query 的导入使用单 Worker，可以设置 `pool: 1`，每个模块各自拥有一个 Worker。
 
 ## 运行行为与限制
 

@@ -188,7 +188,7 @@ export default defineConfig({
 })
 ```
 
-**Migrating to 0.3.0:** calls no longer time out by default. Set `timeoutMs: 30_000` to keep the previous 30-second timeout. The default pool mode remains `'auto'`; set `pool: 1` if unqueried imports should use one Worker per module.
+**Migrating to 0.3.1:** calls no longer time out by default. Set `timeoutMs: 30_000` to keep the previous 30-second timeout. The default pool mode remains `'auto'`; set `pool: 1` if unqueried imports should use one Worker per module.
 
 ## Runtime behavior and limits
 

@@ -123,8 +123,13 @@ test('project pool defaults share resolved imports and allow query overrides in 
         try {
           let url: string
           if (mode === 'development') {
-            const vite = await createServer(config)
-            const http = createHttpServer(vite.middlewares)
+            const http = createHttpServer()
+            closeServer = () => closeHttpServer(http)
+            const vite = await createServer({
+              ...config,
+              server: { middlewareMode: true, hmr: { server: http } },
+            })
+            http.on('request', vite.middlewares)
             closeServer = async () => { await Promise.all([vite.close(), closeHttpServer(http)]) }
             await new Promise<void>((resolve, reject) => {
               http.once('error', reject)
