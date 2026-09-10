@@ -48,7 +48,40 @@ import { add } from './compute.rpc'
 console.log(await add(1, 2)) // 3
 ```
 
-The first call starts a Worker. All exports from the same module share that Worker and its module state; different RPC modules get separate Workers. Importing alone does not start one. Synchronous computation inside an `async` export still runs on the Worker thread.
+The first call starts a Worker. By default, all exports from the same module share one Worker and its module state. Importing alone does not start one. Synchronous computation inside an `async` export still runs on the Worker thread.
+
+## Worker pools
+
+Choose a pool for an import with the `pool` query parameter:
+
+```js
+import { add } from './compute.rpc?pool=4'
+
+const results = await Promise.all([
+  add(1, 2),
+  add(3, 4),
+  add(5, 6),
+])
+```
+
+TypeScript query imports need an explicit module declaration; see [TypeScript](#typescript).
+
+| Import | Maximum Workers in the pool |
+| --- | --- |
+| `./compute.rpc` or `./compute.rpc?pool=1` | One shared Worker; these imports use the same pool. |
+| `./compute.rpc?pool=N` | A positive safe integer `N`. |
+| `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`; falls back to `4` if the hardware value is missing or is not a positive safe integer. |
+| `./compute.rpc?pool=unlimited` | No fixed maximum. |
+
+Pools grow lazily: each call first reuses an idle Worker, then creates a Worker if below the maximum. At the maximum, it immediately sends the call to the Worker with the fewest actual unfinished requests. There is no main-thread task queue. CPU-bound work on one Worker still runs on one thread; asynchronous calls may interleave within that Worker.
+
+`auto` reads the hardware value on the pool's first call, then keeps that maximum. It has no additional fixed cap. `unlimited` reuses idle Workers too; a busy pool can grow without a fixed bound and retains its peak Worker count until disposal or a page reload.
+
+Pool identity is the resolved source module plus its canonical pool mode. Imports from different files or through aliases share a pool when they resolve to the same source and mode. The unqueried import and `pool=1` share a pool. Other modes use separate pools: `auto` stays separate from an explicit numeric mode even when their maxima happen to match. Limits apply per module and mode, not as a global CPU budget for the application.
+
+Every Worker has its own module state. Calls may move between Workers in a pool, so do not rely on a module-level counter, cache, or mutable variable being shared across all calls. A timeout rejects the caller but does not stop the request or make its Worker idle before the actual response arrives.
+
+Numeric values must use decimal digits without leading zeros, from `1` to `Number.MAX_SAFE_INTEGER`. Invalid values such as `0`, `01`, negative numbers, fractions, duplicate `pool` parameters, and unsupported query parameters produce errors. Vite's `?raw`, `?url`, and `?worker` imports retain their normal meanings; they cannot be combined with `pool`.
 
 ## Filename convention
 
@@ -80,6 +113,31 @@ const result = await api.add(1, 2)
 
 `Remote<T>` maps function return types to Promises. It is a type helper, not an additional runtime wrapper. Arguments and results must still be structured-cloneable.
 
+### Query import declarations
+
+TypeScript does not automatically resolve an arbitrary query import to the source module's types, even when the source exports are `async`. Add an explicit declaration for each query spelling and exported function you use:
+
+```ts
+// src/worker-rpc.d.ts — next to src/compute.rpc.ts
+// Keep this file free of top-level import/export statements.
+declare module '*compute.rpc?pool=4' {
+  type API = import('vite-plugin-worker-rpc').Remote<typeof import('./compute.rpc')>
+  export const add: API['add']
+}
+```
+
+```ts
+// src/main.ts
+import { add } from './compute.rpc?pool=4'
+
+const result: number = await add(1, 2)
+// add('1', 2) would be a type error.
+```
+
+Include the `.d.ts` file in your `tsconfig.json`. Its `typeof import('./compute.rpc')` path is relative to the declaration file. Add separate declarations for `?pool=auto`, `?pool=unlimited`, or other numbers you import, listing their exported functions in the same way. An import spelling with an explicit `.ts` extension also needs a matching declaration.
+
+The wildcard suffix must identify **one source module** across your TypeScript project. If several directories contain `compute.rpc.ts`, use unique RPC filenames or a distinguishing pattern such as `*math/compute.rpc?pool=4` and import paths that include that suffix. A broad wildcard cannot automatically infer each matching file's exports. This explicit declaration preserves the original parameter and result types without falling back to `any`; the plugin does not generate these declarations for you.
+
 ## Exports and execution
 
 Supported exports are locally declared named functions, function-valued variables, aliases of those functions, and type-only declarations:
@@ -97,7 +155,7 @@ export { triple as multiplyByThree }
 
 Default exports, exported runtime values/classes, generator functions, runtime re-exports, and `export *` are rejected with build errors. Wrap imported functions in a local exported function, and keep shared constants in a regular module. Unexported module state is allowed.
 
-Implementation imports execute in the Worker. A local RPC module reached from another RPC implementation is a normal local dependency of that Worker; it does not create a nested RPC call. Dependencies must support the Worker environment: there is no `window` or DOM, and Node-only APIs are unavailable. Module initialization runs when the Worker starts, not when the browser imports the proxy.
+Implementation imports execute in the Worker. A local RPC module reached from another RPC implementation is a normal local dependency of that Worker, even when its import includes `?pool=...`; it does not create a nested pool or RPC call. Dependencies must support the Worker environment: there is no `window` or DOM, and Node-only APIs are unavailable. Module initialization runs once in each Worker when it starts, not when the browser imports the proxy.
 
 ## Options
 
@@ -119,13 +177,13 @@ workerRpc({
 
 ## Runtime behavior and limits
 
-- Calls always return Promises. Concurrent requests are matched to their own results. CPU-bound calls in one Worker execute on the same thread; multiple calls do not create a Worker pool.
+- Calls always return Promises. Concurrent requests are matched to their own results; completion order can differ from call order. Pool scheduling does not guarantee that successive calls reach the same Worker.
 - Arguments and results use `postMessage` structured cloning. There are no transfer-list or callback-proxy APIs; functions and DOM nodes cannot cross the boundary.
 - Remote exceptions reject with an `Error` carrying its name, message, and stack when available. Custom error properties and prototypes are not preserved.
-- A timeout rejects the caller's Promise; it does **not** cancel the computation. Worker failures reject pending calls and make that proxy unusable until the page is reloaded.
+- A timeout rejects the caller's Promise; it does **not** cancel the computation, which remains counted as unfinished until its response arrives. A fatal Worker transport failure stops the entire pool, rejects its pending calls, and makes its proxies unusable until the page is reloaded. An exception thrown by an exported function only rejects that call.
 - RPC modules may be imported during SSR. Calling their proxies without browser Worker support rejects; there is no server-side fallback.
 - Changes to tracked Worker sources trigger a full page reload during development. Worker state is reset, and pending calls are discarded with the old page.
-- This version targets browser dedicated Workers. It does not provide SharedWorker support, cancellation, streaming, a public Worker lifecycle API, or automatic TypeScript return-type rewriting.
+- This version targets browser dedicated Workers. It does not provide SharedWorker support, cancellation, streaming, lifecycle methods on generated module proxies, or automatic TypeScript return-type rewriting.
 
 ## Try the playground
 

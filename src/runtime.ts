@@ -14,14 +14,18 @@ export interface RpcWorker extends RpcEndpoint {
   terminate(): void
 }
 
+export type RpcPoolMode = number | 'auto' | 'unlimited'
+
 export interface RpcClientOptions {
+  /** Maximum workers, or a lazily resolved strategy. Defaults to one worker. */
+  pool?: RpcPoolMode
   /** Per-call timeout in milliseconds. Zero (the default) disables the timeout. */
   timeoutMs?: number
 }
 
 export interface RpcClient {
   call(method: string, args: unknown[]): Promise<unknown>
-  /** Reject pending calls and terminate the worker. A disposed client cannot restart. */
+  /** Reject pending calls and terminate all workers. A disposed client cannot restart. */
   dispose(): void
 }
 
@@ -37,6 +41,13 @@ interface PendingCall {
   resolve(value: unknown): void
   reject(reason: Error): void
   timer?: ReturnType<typeof setTimeout>
+}
+
+interface PoolWorker {
+  worker: RpcWorker
+  /** Includes timed-out calls until their actual response arrives. */
+  outstanding: Set<number>
+  onMessage(event: { data: unknown }): void
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -70,21 +81,65 @@ function toError(value: unknown): Error {
 }
 
 /**
- * Create a lazy RPC client. Importing this module or creating a client does not
- * access Worker, so generated modules can also be imported during SSR.
+ * Create a lazy RPC pool. Importing this module or creating a client does not
+ * access Worker or navigator, so generated modules can also be imported during SSR.
  */
 export function createRpcClient(
   factory: () => RpcWorker,
-  { timeoutMs = 0 }: RpcClientOptions = {},
+  { pool = 1, timeoutMs = 0 }: RpcClientOptions = {},
 ): RpcClient {
+  if (pool !== 'auto' && pool !== 'unlimited' &&
+      !(typeof pool === 'number' && Number.isSafeInteger(pool) && pool > 0)) {
+    throw new RangeError('RPC pool must be a positive safe integer, "auto", or "unlimited".')
+  }
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new RangeError('RPC timeoutMs must be a finite, non-negative number.')
   }
 
-  let worker: RpcWorker | undefined
+  const workers: PoolWorker[] = []
+  let poolLimit: number | undefined
   let terminalError: Error | undefined
   let nextId = 0
   const pending = new Map<number, PendingCall>()
+
+  function getPoolLimit(): number {
+    if (poolLimit !== undefined) return poolLimit
+    if (pool === 'unlimited') return poolLimit = Infinity
+    if (pool !== 'auto') return poolLimit = pool
+
+    let concurrency: unknown
+    try {
+      concurrency = globalThis.navigator?.hardwareConcurrency
+    } catch {
+      // Some hosts expose an inaccessible navigator; use the same fallback.
+    }
+    return poolLimit = typeof concurrency === 'number' &&
+      Number.isSafeInteger(concurrency) && concurrency > 0
+      ? Math.max(1, concurrency - 1)
+      : 4
+  }
+
+  function selectWorker(): PoolWorker {
+    const limit = getPoolLimit()
+    const idle = workers.find(candidate => candidate.outstanding.size === 0)
+    if (idle) return idle
+    if (workers.length < limit) {
+      const worker = factory()
+      const selected: PoolWorker = {
+        worker,
+        outstanding: new Set(),
+        onMessage: event => onMessage(selected, event),
+      }
+      workers.push(selected)
+      worker.addEventListener('message', selected.onMessage)
+      worker.addEventListener('error', onError)
+      worker.addEventListener('messageerror', onMessageError)
+      return selected
+    }
+    return workers.reduce((least, candidate) =>
+      candidate.outstanding.size < least.outstanding.size ? candidate : least,
+    )
+  }
 
   function takePending(id: number): PendingCall | undefined {
     const call = pending.get(id)
@@ -100,27 +155,33 @@ export function createRpcClient(
     terminalError = error
     for (const id of pending.keys()) takePending(id)?.reject(error)
 
-    const currentWorker = worker
-    worker = undefined
-    if (currentWorker) {
+    for (const { worker, outstanding, onMessage } of workers.splice(0)) {
+      outstanding.clear()
       try {
-        currentWorker.removeEventListener('message', onMessage)
-        currentWorker.removeEventListener('error', onError)
-        currentWorker.removeEventListener('messageerror', onMessageError)
-      } finally {
-        currentWorker.terminate()
+        worker.removeEventListener('message', onMessage)
+        worker.removeEventListener('error', onError)
+        worker.removeEventListener('messageerror', onMessageError)
+      } catch {
+        // A broken custom transport must not prevent terminating the other workers.
+      }
+      try {
+        worker.terminate()
+      } catch {
+        // Preserve the original failure and continue cleaning up the whole pool.
       }
     }
   }
 
-  function onMessage(event: { data: unknown }): void {
+  function onMessage(source: PoolWorker, event: { data: unknown }): void {
     const message = event.data
     if (
       !isRecord(message) || message.rpc !== protocol || message.type !== 'response' ||
-      typeof message.id !== 'number' || !Number.isSafeInteger(message.id)
+      typeof message.id !== 'number' || !Number.isSafeInteger(message.id) ||
+      !source.outstanding.has(message.id)
     ) return
 
     if (message.ok === true) {
+      source.outstanding.delete(message.id)
       takePending(message.id)?.resolve(message.value)
     } else if (
       message.ok === false && isRecord(message.error) &&
@@ -131,6 +192,7 @@ export function createRpcClient(
         message: message.error.message,
         ...(typeof message.error.stack === 'string' ? { stack: message.error.stack } : {}),
       })
+      source.outstanding.delete(message.id)
       takePending(message.id)?.reject(error)
     }
   }
@@ -153,13 +215,9 @@ export function createRpcClient(
       if (terminalError) return Promise.reject(terminalError)
 
       return new Promise((resolve, reject) => {
+        let selected: PoolWorker
         try {
-          if (!worker) {
-            worker = factory()
-            worker.addEventListener('message', onMessage)
-            worker.addEventListener('error', onError)
-            worker.addEventListener('messageerror', onMessageError)
-          }
+          selected = selectWorker()
         } catch (error) {
           stop(toError(error))
           reject(terminalError)
@@ -169,6 +227,7 @@ export function createRpcClient(
         const id = ++nextId
         const call: PendingCall = { resolve, reject }
         pending.set(id, call)
+        selected.outstanding.add(id)
         if (timeoutMs > 0) {
           call.timer = setTimeout(() => {
             const error = new Error(`RPC call "${method}" timed out after ${timeoutMs} ms.`)
@@ -178,9 +237,10 @@ export function createRpcClient(
         }
 
         try {
-          worker.postMessage({ rpc: protocol, type: 'request', id, method, args })
+          selected.worker.postMessage({ rpc: protocol, type: 'request', id, method, args })
         } catch (error) {
           // An uncloneable argument fails only this call; the worker remains usable.
+          selected.outstanding.delete(id)
           takePending(id)?.reject(toError(error))
         }
       })

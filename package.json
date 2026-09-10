@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-worker-rpc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Import named functions from .rpc modules and run them in Web Workers automatically.",
   "type": "module",
   "license": "MIT",
@@ -57,8 +57,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "test:unit": "tsx --test tests/exports.test.ts tests/runtime.test.ts",
-    "test:integration": "tsx --test tests/integration.test.ts",
+    "test:unit": "tsx --test tests/exports.test.ts tests/runtime.test.ts tests/pool-query.test.ts tests/declarations.test.ts",
+    "test:integration": "tsx --test tests/integration.test.ts tests/pool-integration.test.ts tests/plugin-review.test.ts tests/pool-review.test.ts",
     "check": "npm run typecheck && npm run build && npm test",
     "dev": "vite playground",
     "build:playground": "vite build playground",
