@@ -238,7 +238,7 @@ git push origin main --follow-tags
 
 推送 `v*` 标签会触发工作流。实际发布要求当前 Git ref 是标签，名称严格等于 `v` 加上 `package.json` 中的版本号，例如 `v0.2.0`。正式版本使用 `latest`，预发布版本使用 `next`；如果版本已经发布，则跳过发布。
 
-如果只想验证工作流，在 GitHub Actions 页面手动运行 `publish.yml`，选择 `main` 并保持 `dry_run` 开启（默认值）。这会运行校验和发布演练，不会发布 npm 包。手动正式发布时，选择与版本匹配的标签并关闭 `dry_run`。
+如果只想验证工作流，在 GitHub Actions 页面手动运行 `publish.yml`，选择 `main` 并保持 `dry_run` 开启（默认值）。这会运行测试和打包校验；版本尚未发布时，还会执行 `npm publish --dry-run`，已有版本则跳过此命令，因为 npm 会拒绝对已有版本进行发布演练。整个过程不会发布 npm 包，也不能据此确认实际发布权限。手动正式发布时，选择与版本匹配的标签并关闭 `dry_run`。
 
 ## 协议
 

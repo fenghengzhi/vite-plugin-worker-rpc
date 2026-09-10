@@ -238,7 +238,7 @@ git push origin main --follow-tags
 
 Pushing a `v*` tag triggers the workflow. A real publication requires the Git ref to be a tag matching `v` plus the version in `package.json`, such as `v0.2.0`. Stable versions publish under `latest`, prereleases under `next`; an already-published version is skipped.
 
-To check the workflow without publishing, run `publish.yml` manually from the GitHub Actions page, choose `main`, and keep `dry_run` enabled (the default). This runs validation and a publication dry run; it does not publish a package. For a manual real release, select the matching version tag and disable `dry_run`.
+To check the workflow without publishing, run `publish.yml` manually from the GitHub Actions page, choose `main`, and keep `dry_run` enabled (the default). This runs validation and tarball checks, plus `npm publish --dry-run` if the version is unpublished; npm rejects publication dry runs for existing versions. No package is published, and actual publishing authorization remains unverified. For a manual real release, select the matching version tag and disable `dry_run`.
 
 ## License
 

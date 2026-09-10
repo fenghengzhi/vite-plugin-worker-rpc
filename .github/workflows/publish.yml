@@ -80,12 +80,16 @@ jobs:
         id: package
         run: node scripts/release.mjs pack
       - name: Validate publishing without uploading
-        if: env.DRY_RUN == 'true'
+        if: env.DRY_RUN == 'true' && needs.metadata.outputs.exists == 'false'
         env:
           TARBALL: ${{ steps.package.outputs.tarball }}
         run: |
           npm publish "$TARBALL" --dry-run --access public --tag "$DIST_TAG" --registry https://registry.npmjs.org/
-          printf '%s\n' "Dry run completed for $PACKAGE_NAME@$PACKAGE_VERSION. No package was published; npm trusted publishing was not tested." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "Dry run completed for $PACKAGE_NAME@$PACKAGE_VERSION. No package was published; actual publishing authorization remains unverified." >> "$GITHUB_STEP_SUMMARY"
+      - name: Report dry-run validation of an existing version
+        if: env.DRY_RUN == 'true' && needs.metadata.outputs.exists == 'true'
+        run: |
+          printf '%s\n' "Validation and tarball checks passed for $PACKAGE_NAME@$PACKAGE_VERSION. Skipped npm publish --dry-run because npm rejects already published versions. No package was published; actual publishing authorization remains unverified." >> "$GITHUB_STEP_SUMMARY"
       - name: Publish with npm trusted publishing
         if: env.DRY_RUN == 'false' && needs.metadata.outputs.exists == 'false'
         env:
