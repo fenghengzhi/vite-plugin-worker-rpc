@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101c21" />
+    <title>vite-plugin-worker-rpc · Playground</title>
+    <script type="module" src="/main.ts"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <a class="brand" href="https://github.com/fenghengzhi/vite-plugin-worker-rpc">worker<span>rpc</span><span class="brand-dot">.</span></a>
+        <span class="edition">VITE PLUGIN / PLAYGROUND</span>
+      </header>
+
+      <section class="intro">
+        <p class="eyebrow">让计算去另一个线程</p>
+        <h1>计算继续，<br /><span>交互不停。</span></h1>
+        <p class="lead">一次普通的函数导入，把计算交给 Worker。<br class="desktop-break" />点击开始，观察动画和计数。</p>
+      </section>
+
+      <section class="workspace" aria-label="Worker 计算示例">
+        <div class="compute-panel">
+          <div class="panel-heading"><span class="panel-number">01</span><h2>Worker 负责计算</h2></div>
+          <pre class="code"><code><span class="token-purple">import</span> { compute } <span class="token-purple">from</span> <span class="token-green">'./compute.rpc'</span>
+
+<span class="token-purple">const</span> result = <span class="token-purple">await</span> <span class="token-blue">compute</span>()</code></pre>
+          <div class="action-row">
+            <button id="run" type="button">开始计算 <span aria-hidden="true">↗</span></button>
+            <span class="action-note">连续求和约 1.2 秒</span>
+          </div>
+          <p id="status" class="status" role="status">准备就绪 · 第一次调用时创建 Worker</p>
+          <dl class="result-grid">
+            <div><dt>执行位置</dt><dd id="location">等待运行</dd></div>
+            <div><dt>计算耗时</dt><dd id="duration">—</dd></div>
+            <div><dt>求和次数</dt><dd id="iterations">—</dd></div>
+            <div><dt>求和结果</dt><dd id="sum">—</dd></div>
+          </dl>
+        </div>
+
+        <div class="live-panel">
+          <div class="panel-heading"><span class="panel-number">02</span><h2>主线程持续更新</h2><span class="live-tag"><i></i> LIVE</span></div>
+          <div class="orbit" aria-hidden="true">
+            <div class="orbit-ring ring-one"></div>
+            <div class="orbit-ring ring-two"></div>
+            <div id="satellite" class="satellite"><span></span></div>
+            <div class="orbit-core"><span id="ticks">0000</span><small>画面更新</small></div>
+          </div>
+          <p class="live-caption">动画与数字都由主线程的<br /><code>requestAnimationFrame</code> 更新</p>
+          <div class="frame-summary"><span>本次计算期间更新</span><strong id="frames">—</strong></div>
+        </div>
+      </section>
+
+      <footer><span>一个模块，一个按需启动的 Worker。</span><a href="https://github.com/fenghengzhi/vite-plugin-worker-rpc#readme">查看文档 <span aria-hidden="true">↗</span></a></footer>
+    </main>
+  </body>
+</html>

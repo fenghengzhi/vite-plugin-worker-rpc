@@ -1,0 +1,67 @@
+{
+  "name": "vite-plugin-worker-rpc",
+  "version": "0.1.0",
+  "description": "Import named functions from .rpc modules and run them in Web Workers automatically.",
+  "type": "module",
+  "license": "MIT",
+  "author": "fenghengzhi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fenghengzhi/vite-plugin-worker-rpc.git"
+  },
+  "homepage": "https://github.com/fenghengzhi/vite-plugin-worker-rpc#readme",
+  "bugs": "https://github.com/fenghengzhi/vite-plugin-worker-rpc/issues",
+  "keywords": [
+    "vite-plugin",
+    "worker",
+    "web-worker",
+    "rpc",
+    "typescript"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "peerDependencies": {
+    "vite": "^6.4.0 || ^7.0.0 || ^8.0.0"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.28.0",
+    "@rollup/pluginutils": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "playwright": "^1.55.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.2.2"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "test:unit": "tsx --test tests/exports.test.ts tests/runtime.test.ts",
+    "test:integration": "tsx --test tests/integration.test.ts",
+    "check": "npm run typecheck && npm run build && npm test",
+    "dev": "vite playground",
+    "build:playground": "vite build playground",
+    "prepare": "npm run build"
+  }
+}

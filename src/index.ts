@@ -1,0 +1,128 @@
+import { createHash } from 'node:crypto'
+import { existsSync, realpathSync } from 'node:fs'
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createFilter, type FilterPattern } from '@rollup/pluginutils'
+import { normalizePath, type Plugin, type ResolvedConfig } from 'vite'
+import { collectRpcExports } from './exports.js'
+
+export interface WorkerRpcOptions {
+  /** Modules to transform. Defaults to files ending in .rpc.ts, .rpc.js, .rpc.mts or .rpc.mjs. */
+  include?: FilterPattern
+  /** Modules to leave unchanged. Defaults to node_modules. */
+  exclude?: FilterPattern
+  /** Per-call deadline in milliseconds. 0 disables it. Defaults to 30 seconds. */
+  timeoutMs?: number
+}
+
+/** The runtime shape of a module imported from the browser. */
+export type Remote<T> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => infer R
+    ? (...args: A) => Promise<Awaited<R>>
+    : never
+}
+
+const sourceFlag = 'worker-rpc-source'
+const scriptPattern = /\.(?:[cm]?[jt]s|[jt]sx)$/
+const cleanId = (id: string) => id.split('?', 1)[0]!
+const isSource = (id: string) => new URLSearchParams(id.split('?')[1]).has(sourceFlag)
+const sourceId = (id: string) => `${id}${id.includes('?') ? '&' : '?'}${sourceFlag}`
+const jsString = (value: string) => JSON.stringify(value)
+function importPath(from: string, to: string): string {
+  const path = normalizePath(relative(dirname(from), to))
+  return path.startsWith('.') ? path : `./${path}`
+}
+
+/** Turn named function imports from *.rpc.ts / *.rpc.js into lazy Worker calls. */
+export default function workerRpc(options: WorkerRpcOptions = {}): Plugin {
+  let matches: ReturnType<typeof createFilter>
+  const timeoutMs = options.timeoutMs ?? 30_000
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647) {
+    throw new TypeError('[vite-plugin-worker-rpc] timeoutMs must be an integer between 0 and 2147483647.')
+  }
+  let config: ResolvedConfig
+  const workerFiles = new Set<string>()
+  const runtimeJs = fileURLToPath(new URL('./runtime.js', import.meta.url))
+  const runtime = realpathSync(existsSync(runtimeJs) ? runtimeJs : fileURLToPath(new URL('./runtime.ts', import.meta.url)))
+  async function cacheDirectory(): Promise<string> {
+    const cache = resolve(config.cacheDir, 'worker-rpc')
+    await mkdir(cache, { recursive: true })
+    // Vite resolves Worker entries through realpath. Relative imports must use
+    // the same canonical directory, especially for macOS /var -> /private/var.
+    return realpath(cache)
+  }
+
+  return {
+    name: 'vite-plugin-worker-rpc',
+    enforce: 'pre',
+    configResolved(resolved) {
+      config = resolved
+      matches = createFilter(
+        options.include ?? '**/*.rpc.{ts,js,mts,mjs}',
+        options.exclude ?? '**/node_modules/**',
+        { resolve: resolved.root },
+      )
+    },
+    async configureServer(server) {
+      // cacheDir may live outside root (for example in a monorepo). Only grant
+      // access to our generated entries; retain Vite's existing allow list.
+      const entries = normalizePath(await cacheDirectory())
+      if (!server.config.server.fs.allow.includes(entries)) server.config.server.fs.allow.push(entries)
+    },
+    async resolveId(source, importer, resolveOptions) {
+      // Keep the entire local dependency graph in the Worker, including RPC
+      // modules imported indirectly through helpers. Bare packages keep Vite's
+      // normal dependency optimization and resolution behavior.
+      if (!importer || !isSource(importer) || source.includes('?') || source.startsWith('\0')) return
+      const resolved = await this.resolve(source, importer, { ...resolveOptions, skipSelf: true })
+      if (!resolved || resolved.external || !isAbsolute(resolved.id) ||
+          resolved.id.includes('/node_modules/') || !scriptPattern.test(resolved.id)) return resolved
+      workerFiles.add(normalizePath(resolved.id))
+      return { ...resolved, id: sourceId(resolved.id) }
+    },
+    async transform(code, id) {
+      let filename = cleanId(id)
+      if (isSource(id)) {
+        workerFiles.add(normalizePath(filename))
+        return
+      }
+      if (!matches(filename) || id.includes('?') || config.isWorker) return
+      const names = collectRpcExports(code, filename)
+      if (!names.length) return { code: 'export {};', map: null }
+      filename = await realpath(filename)
+      const cache = await cacheDirectory()
+      const hash = createHash('sha256').update(normalizePath(filename)).digest('hex').slice(0, 20)
+      const entry = resolve(cache, `${hash}.mjs`)
+      const workerCode = [
+        `import { exposeRpc } from ${jsString(importPath(entry, runtime))};`,
+        `import * as api from ${jsString(sourceId(importPath(entry, filename)))};`,
+        'exposeRpc(api);',
+      ].join('\n')
+      if (await readFile(entry, 'utf8').catch(() => '') !== workerCode) await writeFile(entry, workerCode)
+      this.addWatchFile(filename)
+      workerFiles.add(normalizePath(filename))
+      return {
+        code: [
+          `import { createRpcClient } from ${jsString(normalizePath(runtime))};`,
+          'const rpc = createRpcClient(() => {',
+          '  if (typeof Worker === "undefined") throw new Error("[vite-plugin-worker-rpc] RPC calls require a browser with Web Worker support. Calls during SSR are not supported.");',
+          `  return new Worker(new URL(${jsString(importPath(filename, entry))}, import.meta.url), { type: "module" });`,
+          `}, { timeoutMs: ${timeoutMs} });`,
+          ...names.map((name, index) => `const call${index} = (...args) => rpc.call(${jsString(name)}, args);\nexport { call${index} as ${jsString(name)} };`),
+          'if (import.meta.hot) import.meta.hot.dispose(() => rpc.dispose());',
+        ].join('\n'),
+        map: null,
+      }
+    },
+    handleHotUpdate(context) {
+      // Workers cannot accept regular module HMR. Reload to replace their whole
+      // module graph and avoid retaining old state or old function proxies.
+      if (workerFiles.has(normalizePath(context.file))) {
+        for (const module of context.modules) context.server.moduleGraph.invalidateModule(module)
+        context.server.ws.send({ type: 'full-reload', path: '*' })
+        return []
+      }
+    },
+  }
+}
