@@ -29,11 +29,23 @@ export function publishedVersion(result, version) {
     throw new Error('npm returned an invalid registry response; refusing to assume the version is unpublished.')
   }
   if (result.status === 0) {
-    if (data !== version) throw new Error('npm returned a different version than requested.')
+    // npm 12 returns an array even when an exact spec selects one version;
+    // npm 10/11 return the scalar for a single requested field.
+    const found = Array.isArray(data) && data.length === 1 ? data[0] : data
+    if (found !== version) throw new Error('npm returned a different version than requested.')
     return true
   }
   if (result.status !== null && data?.error?.code === 'E404') return false
   throw new Error(`Cannot check npm version: ${data?.error?.code ?? result.status}.`)
+}
+
+export function packedPackage(data, pkg) {
+  // npm 12 keys pack results by package name; earlier CLIs return an array.
+  const packs = Array.isArray(data) ? data : data && typeof data === 'object' ? Object.values(data) : []
+  if (packs.length !== 1 || packs[0]?.name !== pkg.name || packs[0]?.version !== pkg.version) {
+    throw new Error('Packed package does not match package.json.')
+  }
+  return packs[0]
 }
 
 function output(values) {
@@ -63,11 +75,7 @@ function main(command) {
   } else if (command === 'pack') {
     const result = run(['pack', '--json'])
     if (result.status !== 0) throw new Error('npm pack failed.')
-    const packs = JSON.parse(result.stdout)
-    if (packs.length !== 1 || packs[0].name !== pkg.name || packs[0].version !== pkg.version) {
-      throw new Error('Packed package does not match package.json.')
-    }
-    const pack = packs[0]
+    const pack = packedPackage(JSON.parse(result.stdout), pkg)
     if (basename(pack.filename) !== pack.filename || !pack.filename.endsWith('.tgz')) throw new Error('Unexpected tarball path.')
     const files = new Set(pack.files.map(file => file.path))
     for (const file of ['dist/index.js', 'dist/index.d.ts', 'dist/runtime.js', 'dist/runtime.d.ts', 'dist/pool-query.js', 'LICENSE']) {
