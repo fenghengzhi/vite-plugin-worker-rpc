@@ -78,7 +78,7 @@ function main(command) {
     const pack = packedPackage(JSON.parse(result.stdout), pkg)
     if (basename(pack.filename) !== pack.filename || !pack.filename.endsWith('.tgz')) throw new Error('Unexpected tarball path.')
     const files = new Set(pack.files.map(file => file.path))
-    for (const file of ['dist/index.js', 'dist/index.d.ts', 'dist/runtime.js', 'dist/runtime.d.ts', 'dist/pool-query.js', 'LICENSE']) {
+    for (const file of ['dist/index.js', 'dist/index.d.ts', 'dist/runtime.js', 'dist/runtime.d.ts', 'dist/client.js', 'dist/client.d.ts', 'dist/remote.d.ts', 'dist/pool-query.js', 'LICENSE']) {
       if (!files.has(file)) throw new Error(`Release tarball is missing ${file}.`)
     }
     output({ tarball: pack.filename })

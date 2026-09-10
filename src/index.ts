@@ -10,6 +10,7 @@ import { parsePoolQuery, poolModuleId } from './pool-query.js'
 import type { RpcPoolMode } from './runtime.js'
 
 export type { RpcPoolMode } from './runtime.js'
+export type { Remote } from './remote.js'
 
 export interface WorkerRpcOptions {
   /** Modules to transform. Defaults to files ending in .rpc.ts, .rpc.js, .rpc.mts or .rpc.mjs. */
@@ -20,13 +21,6 @@ export interface WorkerRpcOptions {
   pool?: RpcPoolMode
   /** Per-call deadline in milliseconds. 0 (the default) disables it. */
   timeoutMs?: number
-}
-
-/** The runtime shape of a module imported from the browser. */
-export type Remote<T> = {
-  [K in keyof T]: T[K] extends (...args: infer A) => infer R
-    ? (...args: A) => Promise<Awaited<R>>
-    : never
 }
 
 const sourceFlag = 'worker-rpc-source'
@@ -75,6 +69,9 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
       if (workerBuild) return
       const existingPlugins = userConfig.worker?.plugins
       return {
+        // Public helpers and generated clients must share Comlink's transfer
+        // handlers/markers instead of embedding separate optimized copies.
+        optimizeDeps: { exclude: ['vite-plugin-worker-rpc/client', 'vite-plugin-worker-rpc/runtime', 'comlink'] },
         worker: {
           // Worker builds have a separate plugin pipeline. Use a fresh instance
           // to normalize nested RPC queries while preserving user Worker plugins.

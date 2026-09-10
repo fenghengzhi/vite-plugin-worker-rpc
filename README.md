@@ -10,7 +10,7 @@ import { add } from './compute.rpc'
 const result = await add(1, 2)
 ```
 
-A Vite plugin that turns named function exports from `*.rpc.ts` and `*.rpc.js` into asynchronous Worker calls. It generates the Worker entry and browser proxy, with no runtime library to configure.
+A Vite plugin that turns named function exports from `*.rpc.ts` and `*.rpc.js` into asynchronous Worker calls. It generates the Worker entry and browser proxy. [Comlink](https://github.com/GoogleChromeLabs/comlink) handles RPC messages, serialization, and remote references; the plugin handles Vite integration and Worker pools. Comlink is included as a dependency and needs no separate setup.
 
 ## Install
 
@@ -114,7 +114,7 @@ const api = implementation as unknown as Remote<typeof implementation>
 const result = await api.add(1, 2)
 ```
 
-`Remote<T>` maps function return types to Promises. It is a type helper, not an additional runtime wrapper. Arguments and results must still be structured-cloneable.
+`Remote<T>` describes the generated module's exported functions using Comlink's argument and result mappings, including values marked with `proxy()`. It is a type helper, not an additional runtime wrapper. Use it for APIs with callback parameters or returned proxies too: `async` alone does not describe how these values change across threads. Unmarked arguments and results must be structured-cloneable.
 
 ### Query import declarations
 
@@ -160,6 +160,106 @@ Default exports, exported runtime values/classes, generator functions, runtime r
 
 Implementation imports execute in the Worker. A local RPC module reached from another RPC implementation is a normal local dependency of that Worker, even when its import includes `?pool=...`; it does not create a nested pool or RPC call. Dependencies must support the Worker environment: there is no `window` or DOM, and Node-only APIs are unavailable. Module initialization runs once in each Worker when it starts, not when the browser imports the proxy.
 
+## Callbacks, transfers, and remote objects
+
+The browser-safe `vite-plugin-worker-rpc/client` entry exports Comlink's `proxy`, `transfer`, `releaseProxy`, and `transferHandlers`. Use this entry in both browser and Worker code so the helpers and transport share the same Comlink instance within each thread; mixing another Comlink installation can create different symbols and handler registries.
+
+### Callback parameters
+
+Mark a callback with `proxy()`. It stays in the thread where it was created; the Worker calls it asynchronously and can await its return value or catch its exception.
+
+```ts
+// src/compute.rpc.ts
+import { releaseProxy, type RemoteProxy } from 'vite-plugin-worker-rpc/client'
+
+export async function calculate(value: number, callback: RemoteProxy<(n: number) => number>) {
+  try {
+    return await callback(value)
+  } finally {
+    callback[releaseProxy]() // This invocation has finished using this remote reference.
+  }
+}
+```
+
+```ts
+// src/main.ts
+import * as implementation from './compute.rpc'
+import type { Remote } from 'vite-plugin-worker-rpc'
+import { proxy } from 'vite-plugin-worker-rpc/client'
+
+const api = implementation as unknown as Remote<typeof implementation>
+const result = await api.calculate(21, proxy((n: number) => n * 2)) // 42
+```
+
+`RemoteProxy<T>` describes the receiver's asynchronous Comlink reference and preserves the proxy marker needed for parameter inference. `proxy()` marks the sender's original value; it does not turn that value into a remote reference locally. Call `[releaseProxy]()` on the received reference, after its last use. If several operations share a received reference, wait for all of them before releasing it. Sending the same original callback in multiple RPC calls creates an independent Comlink endpoint for each transmission, so each receiver releases its own reference without invalidating the other transmissions.
+
+### Transfer ownership instead of copying
+
+Ordinary `ArrayBuffer` values are cloned. `transfer(value, transferables)` moves the listed resources to the receiving thread. For an `ArrayBuffer`, this detaches the sender's buffer when the message is sent. Transfers work in both directions:
+
+```ts
+// src/buffers.rpc.ts
+import { transfer } from 'vite-plugin-worker-rpc/client'
+
+export async function increment(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer)
+  for (let i = 0; i < bytes.length; i++) bytes[i] = bytes[i]! + 1
+  return transfer(buffer, [buffer]) // Move ownership back to the browser.
+}
+```
+
+```ts
+// src/main.ts
+import { increment } from './buffers.rpc'
+import { transfer } from 'vite-plugin-worker-rpc/client'
+
+const buffer = new Uint8Array([1, 2, 3]).buffer
+const result = await increment(transfer(buffer, [buffer]))
+console.log(buffer.byteLength) // 0: the original buffer was detached.
+console.log([...new Uint8Array(result)]) // [2, 3, 4]
+```
+
+A transferred buffer cannot be reused as the input to concurrent calls; use separate buffers or omit `transfer()` to clone instead. Wrap the direct argument or direct return value with `transfer()`; its transfer list can include buffers contained in that value.
+
+### Return a remote object or function
+
+An RPC export can return `proxy(object)` or `proxy(function)` to keep that value in its Worker. The `proxy()` result carries Comlink's type marker, which `Remote<T>` uses to describe the browser's asynchronous reference:
+
+```ts
+// src/counter.rpc.ts
+import { proxy } from 'vite-plugin-worker-rpc/client'
+
+export async function createCounter() {
+  let value = 0
+  return proxy({ increment: () => ++value })
+}
+```
+
+```ts
+// src/main.ts
+import * as implementation from './counter.rpc'
+import type { Remote } from 'vite-plugin-worker-rpc'
+import { releaseProxy } from 'vite-plugin-worker-rpc/client'
+
+const api = implementation as unknown as Remote<typeof implementation>
+const counter = await api.createCounter()
+try {
+  console.log(await counter.increment()) // 1
+} finally {
+  counter[releaseProxy]()
+}
+```
+
+Keep the inferred `proxy()` return type, or explicitly preserve its proxy marker; annotating it as an ordinary unmarked object or function loses the remote type mapping. Calls through a returned reference stay attached to its owning Worker. They use Comlink directly and do not participate in the plugin's pool scheduling, load accounting, or `timeoutMs` deadline.
+
+### Custom serialization and lifecycle
+
+Comlink's `transferHandlers` can serialize additional value types. Register each handler under the **same name on both sides before the call**. For example, put the registration in a regular shared module, import `transferHandlers` from `vite-plugin-worker-rpc/client` there, and import that module from both the browser entry and the RPC implementation. See [Comlink's transfer handler API](https://github.com/GoogleChromeLabs/comlink#transfer-handlers-and-event-listeners) for the `canHandle`, `serialize`, and `deserialize` contract.
+
+Comlink processes direct arguments and direct return values; it does not recursively apply these helpers or handlers to nested properties. For example, `{ callback: proxy(fn) }` is not automatically a supported callback parameter: pass `proxy(fn)` as its own argument, proxy the containing object, or provide a handler for the containing value. DOM nodes and unmarked functions are not structured-cloneable.
+
+The application owns the lifetime of received callback and returned-object references. Release them after the last use, including error paths; garbage collection is not a deterministic cleanup mechanism. Stopping the pool cleans up the pool's Workers and its own transport resources. It does not guarantee cleanup of every callback channel or returned proxy held by application code. A timeout does not release those references or cancel computation.
+
 ## Options
 
 | Option | Default | Meaning |
@@ -190,11 +290,13 @@ export default defineConfig({
 
 **Migrating to 0.3.1:** calls no longer time out by default. Set `timeoutMs: 30_000` to keep the previous 30-second timeout. The default pool mode remains `'auto'`; set `pool: 1` if unqueried imports should use one Worker per module.
 
+**Migrating to 0.4.0:** RPC uses Comlink. Error handling follows Comlink too: structured-cloneable non-`Error` throws keep their original value, and an unserializable return value rejects with `TypeError: Unserializable return value`. Use the client helpers above for callbacks and explicit transfers.
+
 ## Runtime behavior and limits
 
 - Calls always return Promises. Concurrent requests are matched to their own results; completion order can differ from call order. Pool scheduling does not guarantee that successive calls reach the same Worker.
-- Arguments and results use `postMessage` structured cloning. There are no transfer-list or callback-proxy APIs; functions and DOM nodes cannot cross the boundary.
-- Remote exceptions reject with an `Error` carrying its name, message, and stack when available. Custom error properties and prototypes are not preserved.
+- Comlink serializes arguments and results using structured cloning by default. Use the client helpers above for explicit transfers, callback proxies, remote objects, or custom handlers.
+- Comlink transports remote exceptions. Thrown `Error` objects preserve their name, message, and stack when available, but not custom properties or prototypes. Structured-cloneable non-`Error` thrown values remain non-`Error` values.
 - A timeout rejects the caller's Promise; it does **not** cancel the computation, which remains counted as unfinished until its response arrives. A fatal Worker transport failure stops the entire pool, rejects its pending calls, and makes its proxies unusable until the page is reloaded. An exception thrown by an exported function only rejects that call.
 - RPC modules may be imported during SSR. Calling their proxies without browser Worker support rejects; there is no server-side fallback.
 - Changes to tracked Worker sources trigger a full page reload during development. Worker state is reset, and pending calls are discarded with the old page.

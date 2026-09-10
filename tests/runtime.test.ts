@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 import { test } from 'node:test'
 import { createRpcClient, exposeRpc, type RpcClientOptions, type RpcEndpoint, type RpcWorker } from '../src/runtime.js'
 
@@ -6,9 +7,9 @@ type Listener = (event: never) => void
 
 class FakePort {
   peer?: FakePort
-  messages: unknown[] = []
   listeners = new Map<string, Set<Listener>>()
   terminated = 0
+  closed = false
 
   addEventListener(type: string, listener: Listener): void {
     let listeners = this.listeners.get(type)
@@ -24,15 +25,38 @@ class FakePort {
     for (const listener of this.listeners.get(type) ?? []) listener(event as never)
   }
 
-  postMessage(message: unknown): void {
-    const cloned = structuredClone(message)
-    this.messages.push(cloned)
-    queueMicrotask(() => this.peer?.emit('message', { data: cloned }))
+  postMessage(message: unknown, transfer: Transferable[] = []): void {
+    const cloned = structuredClone(message, { transfer })
+    queueMicrotask(() => {
+      if (!this.closed && !this.peer?.closed) this.peer?.emit('message', { data: cloned })
+    })
   }
+
+  start(): void {}
 
   terminate(): void {
     this.terminated++
+    this.closed = true
+    if (this.peer) this.peer.closed = true
   }
+}
+
+test('expose initialization failure removes its transport listeners', () => {
+  const endpoint = new class extends FakePort {
+    start(): void { throw new Error('endpoint cannot start') }
+  }()
+  assert.throws(() => exposeRpc({}, endpoint as unknown as RpcEndpoint), /endpoint cannot start/)
+  for (const listeners of endpoint.listeners.values()) assert.equal(listeners.size, 0)
+})
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 function pair(api: object, options: { timeoutMs?: number } = {}) {
@@ -49,28 +73,56 @@ function pair(api: object, options: { timeoutMs?: number } = {}) {
   return { worker, server, client, cleanup, get created() { return created } }
 }
 
+interface Invocation {
+  args: unknown[]
+  resolve(value: unknown): void
+  reject(reason: unknown): void
+}
+
+class FakeWorker extends FakePort {
+  calls: Invocation[] = []
+}
+
 function poolContext(options?: RpcClientOptions) {
-  const workers: FakePort[] = []
+  const workers: FakeWorker[] = []
+  let totalStarted = 0
+  const startedWaiters = new Set<{ count: number; resolve(): void }>()
   const client = createRpcClient(() => {
-    const worker = new FakePort()
+    const worker = new FakeWorker()
+    const server = new FakePort()
+    worker.peer = server
+    server.peer = worker
     workers.push(worker)
+    exposeRpc({
+      hold(...args: unknown[]) {
+        const gate = deferred<unknown>()
+        worker.calls.push({ args, resolve: gate.resolve, reject: gate.reject })
+        totalStarted++
+        for (const waiter of startedWaiters) {
+          if (totalStarted >= waiter.count) {
+            startedWaiters.delete(waiter)
+            waiter.resolve()
+          }
+        }
+        return gate.promise
+      },
+      echo: (value: unknown) => value,
+    }, server as unknown as RpcEndpoint)
     return worker as unknown as RpcWorker
   }, options)
-  function response(workerIndex: number, requestIndex: number, value: unknown = 'done') {
-    const request = workers[workerIndex]!.messages[requestIndex] as Record<string, unknown>
-    return { ...request, type: 'response', ok: true, value }
+
+  function started(count: number): Promise<void> {
+    if (totalStarted >= count) return Promise.resolve()
+    return new Promise(resolve => startedWaiters.add({ count, resolve }))
   }
-  function reply(workerIndex: number, requestIndex: number, value?: unknown) {
-    workers[workerIndex]!.emit('message', { data: response(workerIndex, requestIndex, value) })
-  }
-  function replyAll() {
-    for (const [workerIndex, worker] of workers.entries()) {
-      for (let requestIndex = 0; requestIndex < worker.messages.length; requestIndex++) {
-        reply(workerIndex, requestIndex)
-      }
+
+  function resolveAll() {
+    for (const worker of workers) {
+      for (const call of worker.calls) call.resolve('done')
     }
   }
-  return { client, workers, response, reply, replyAll }
+
+  return { client, workers, started, resolveAll }
 }
 
 function replaceNavigator(value: unknown): () => void {
@@ -80,6 +132,10 @@ function replaceNavigator(value: unknown): () => void {
     if (descriptor) Object.defineProperty(globalThis, 'navigator', descriptor)
     else Reflect.deleteProperty(globalThis, 'navigator')
   }
+}
+
+function assertNoListeners(worker: FakePort): void {
+  for (const listeners of worker.listeners.values()) assert.equal(listeners.size, 0)
 }
 
 test('lazily creates one worker and calls sync and async exports', async () => {
@@ -96,26 +152,22 @@ test('lazily creates one worker and calls sync and async exports', async () => {
 })
 
 test('correlates concurrent calls that finish out of order', async () => {
-  const finish = new Map<string, (value: string) => void>()
-  const context = pair({ hold: (key: string) => new Promise<string>(resolve => finish.set(key, resolve)) })
+  const context = poolContext({ pool: 1 })
   const first = context.client.call('hold', ['first'])
   const second = context.client.call('hold', ['second'])
-  await Promise.resolve()
-  finish.get('second')!('two')
+  await context.started(2)
+  assert.deepEqual(context.workers[0]!.calls.map(call => call.args), [['first'], ['second']])
+  context.workers[0]!.calls[1]!.resolve('two')
   assert.equal(await second, 'two')
-  finish.get('first')!('one')
+  context.workers[0]!.calls[0]!.resolve('one')
   assert.equal(await first, 'one')
-  const ids = context.worker.messages.map(message => (message as { id: number }).id)
-  assert.equal(new Set(ids).size, 2)
   context.client.dispose()
 })
 
-test('serializes sync throws, async rejections, and non-Error thrown values', async () => {
+test('preserves remote Error names, messages, and stacks', async () => {
   const context = pair({
     fail() { throw new RangeError('outside range') },
     async reject() { throw new TypeError('bad input') },
-    throwString() { throw 'plain failure' },
-    throwUnserializable() { throw Object.create(null) },
   })
   await assert.rejects(context.client.call('fail', []), error => {
     assert.equal((error as Error).name, 'RangeError')
@@ -124,8 +176,19 @@ test('serializes sync throws, async rejections, and non-Error thrown values', as
     return true
   })
   await assert.rejects(context.client.call('reject', []), { name: 'TypeError', message: 'bad input' })
-  await assert.rejects(context.client.call('throwString', []), /plain failure/)
-  await assert.rejects(context.client.call('throwUnserializable', []), /Unknown RPC error/)
+  context.client.dispose()
+})
+
+test('non-Error thrown values reject their call without breaking subsequent calls', async () => {
+  const context = pair({
+    throwString() { throw 'plain failure' },
+    echo: (value: unknown) => value,
+  })
+  await assert.rejects(context.client.call('throwString', []), reason => {
+    assert.ok(reason === 'plain failure' || reason instanceof Error && reason.message.includes('plain failure'))
+    return true
+  })
+  assert.equal(await context.client.call('echo', [42]), 42)
   context.client.dispose()
 })
 
@@ -140,7 +203,7 @@ test('rejects missing, inherited, and non-function exports', async () => {
 test('clone failures reject one call while subsequent calls still work', async () => {
   const context = pair({ echo: (value: unknown) => value, badResult: () => () => 1 })
   await assert.rejects(context.client.call('echo', [() => 1]), { name: 'DataCloneError' })
-  await assert.rejects(context.client.call('badResult', []), { name: 'DataCloneError' })
+  await assert.rejects(context.client.call('badResult', []), { name: 'TypeError', message: 'Unserializable return value' })
   const original = { date: new Date(0), map: new Map([['answer', 42]]) }
   const result = await context.client.call('echo', [original])
   assert.deepEqual(result, original)
@@ -149,32 +212,17 @@ test('clone failures reject one call while subsequent calls still work', async (
   context.client.dispose()
 })
 
-test('ignores unrelated messages and malformed protocol responses', async () => {
-  let finish!: (value: number) => void
-  const context = pair({ hold: () => new Promise<number>(resolve => { finish = resolve }) })
-  const result = context.client.call('hold', [])
-  const request = context.worker.messages[0] as Record<string, unknown>
-  context.worker.emit('message', { data: { ...request, type: 'response', rpc: 'other', ok: true, value: 999 } })
-  context.worker.emit('message', { data: { ...request, type: 'response', ok: false, error: null } })
-  context.worker.emit('message', { data: { ...request, type: 'response', id: 999, ok: true, value: 999 } })
-  context.server.emit('message', { data: { ...request, rpc: 'other' } })
-  await Promise.resolve()
-  finish(42)
-  assert.equal(await result, 42)
-  assert.equal(context.server.messages.length, 1)
-  context.client.dispose()
-})
-
 test('dispose rejects all pending and future calls and removes listeners', async () => {
-  const context = pair({ hold: () => new Promise(() => {}) })
+  const context = poolContext({ pool: 1 })
   const first = assert.rejects(context.client.call('hold', []), /disposed/)
   const second = assert.rejects(context.client.call('hold', []), /disposed/)
+  await context.started(2)
   context.client.dispose()
   await Promise.all([first, second])
   await assert.rejects(context.client.call('hold', []), /disposed/)
   context.client.dispose()
-  assert.equal(context.worker.terminated, 1)
-  for (const listeners of context.worker.listeners.values()) assert.equal(listeners.size, 0)
+  assert.equal(context.workers[0]!.terminated, 1)
+  assertNoListeners(context.workers[0]!)
 })
 
 test('disposing an unused client never creates a worker', async () => {
@@ -186,16 +234,18 @@ test('disposing an unused client never creates a worker', async () => {
 
 for (const event of ['error', 'messageerror']) {
   test(`worker ${event} rejects pending and future calls and terminates once`, async () => {
-    const context = pair({ hold: () => new Promise(() => {}) })
+    const context = poolContext({ pool: 1 })
     const expected = event === 'error' ? /worker crashed/ : /deserialize/
     const first = assert.rejects(context.client.call('hold', []), expected)
     const second = assert.rejects(context.client.call('hold', []), expected)
-    context.worker.emit(event, { message: 'worker crashed' })
+    await context.started(2)
+    context.workers[0]!.emit(event, { message: 'worker crashed' })
     await Promise.all([first, second])
     await assert.rejects(context.client.call('hold', []), expected)
     context.client.dispose()
-    assert.equal(context.worker.terminated, 1)
-    assert.equal(context.created, 1)
+    assert.equal(context.workers[0]!.terminated, 1)
+    assert.equal(context.workers.length, 1)
+    assertNoListeners(context.workers[0]!)
   })
 }
 
@@ -208,17 +258,34 @@ test('a worker construction failure is an asynchronous terminal rejection', asyn
   client.dispose()
 })
 
-test('timeout rejects only the timed out call and ignores a late response', async () => {
-  let finish!: (value: number) => void
-  const context = pair({
-    hold: () => new Promise<number>(resolve => { finish = resolve }),
-    add: (a: number, b: number) => a + b,
-  }, { timeoutMs: 20 })
-  await assert.rejects(context.client.call('hold', []), { name: 'TimeoutError' })
-  finish(42)
-  assert.equal(await context.client.call('add', [2, 3]), 5)
-  assert.equal(context.created, 1)
+test('timeout rejects only the timed out call and accepts subsequent calls', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const context = poolContext({ pool: 1, timeoutMs: 20 })
+  const timeout = assert.rejects(context.client.call('hold', []), { name: 'TimeoutError' })
+  await context.started(1)
+  t.mock.timers.tick(20)
+  await timeout
+  context.workers[0]!.calls[0]!.resolve(42)
+  assert.equal(await context.client.call('echo', [5]), 5)
+  assert.equal(context.workers.length, 1)
   context.client.dispose()
+})
+
+test('the default timeout and explicit zero both allow long-running calls', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  for (const options of [{ pool: 1 }, { pool: 1, timeoutMs: 0 }]) {
+    const context = poolContext(options)
+    const result = context.client.call('hold', [])
+    let settled = false
+    void result.then(() => { settled = true }, () => { settled = true })
+    await context.started(1)
+    t.mock.timers.tick(60_001)
+    await nextTurn()
+    assert.equal(settled, false)
+    context.workers[0]!.calls[0]!.resolve('finished')
+    assert.equal(await result, 'finished')
+    context.client.dispose()
+  }
 })
 
 test('validates timeout options', () => {
@@ -228,15 +295,21 @@ test('validates timeout options', () => {
 })
 
 test('server cleanup removes its listener and suppresses an in-flight response', async () => {
-  let finish!: (value: number) => void
-  const context = pair({ hold: () => new Promise<number>(resolve => { finish = resolve }) })
-  const rejection = assert.rejects(context.client.call('hold', []), /disposed/)
-  await Promise.resolve()
+  const started = deferred<void>()
+  const finish = deferred<number>()
+  const context = pair({ hold: () => { started.resolve(); return finish.promise } })
+  const result = context.client.call('hold', [])
+  const rejection = assert.rejects(result, /disposed/)
+  let settled = false
+  void result.then(() => { settled = true }, () => { settled = true })
+  await started.promise
   context.cleanup()
-  finish(42)
-  await Promise.resolve()
-  assert.equal(context.server.messages.length, 0)
-  assert.equal(context.server.listeners.get('message')?.size, 0)
+  assertNoListeners(context.server)
+  finish.resolve(42)
+  // FakePort delivers via microtasks; crossing a turn drains any response without
+  // assuming how many promises the RPC library uses to process it.
+  await nextTurn()
+  assert.equal(settled, false)
   context.client.dispose()
   await rejection
 })
@@ -246,11 +319,14 @@ for (const pool of [1, 2, 3]) {
     const context = poolContext({ pool })
     assert.equal(context.workers.length, 0)
     const calls = Array.from({ length: 11 }, (_, index) => context.client.call('hold', [index]))
+    await context.started(11)
     assert.equal(context.workers.length, pool)
-    const counts = context.workers.map(worker => worker.messages.length)
+    const counts = context.workers.map(worker => worker.calls.length)
     assert.equal(counts.reduce((sum, value) => sum + value, 0), 11, 'calls must not enter a main-thread queue')
     assert.ok(Math.max(...counts) - Math.min(...counts) <= 1)
-    context.replyAll()
+    assert.deepEqual(context.workers.flatMap(worker => worker.calls.map(call => call.args[0])).sort((a, b) => Number(a) - Number(b)),
+      Array.from({ length: 11 }, (_, index) => index))
+    context.resolveAll()
     await Promise.all(calls)
     context.client.dispose()
   })
@@ -258,99 +334,103 @@ for (const pool of [1, 2, 3]) {
 
 test('finite pools reuse idle workers before creating another', async () => {
   const context = poolContext({ pool: 3 })
-  const first = context.client.call('hold', [])
-  context.reply(0, 0)
+  const first = context.client.call('hold', ['first'])
+  await context.started(1)
+  context.workers[0]!.calls[0]!.resolve('done')
   await first
-  const second = context.client.call('hold', [])
+  const second = context.client.call('hold', ['second'])
+  await context.started(2)
   assert.equal(context.workers.length, 1)
-  const third = context.client.call('hold', [])
+  const third = context.client.call('hold', ['third'])
+  await context.started(3)
   assert.equal(context.workers.length, 2)
-  context.reply(0, 1)
+  context.workers[0]!.calls[1]!.resolve('done')
   await second
-  const fourth = context.client.call('hold', [])
+  const fourth = context.client.call('hold', ['fourth'])
+  await context.started(4)
   assert.equal(context.workers.length, 2, 'an idle worker should prevent unnecessary growth')
-  assert.equal(context.workers[0]!.messages.length, 3)
-  context.replyAll()
+  assert.deepEqual(context.workers[0]!.calls.map(call => call.args), [['first'], ['second'], ['fourth']])
+  context.resolveAll()
   await Promise.all([third, fourth])
   context.client.dispose()
 })
 
 test('a full pool dispatches to the worker with the fewest actual outstanding calls', async () => {
   const context = poolContext({ pool: 3 })
-  const calls = Array.from({ length: 7 }, () => context.client.call('hold', []))
-  assert.deepEqual(context.workers.map(worker => worker.messages.length), [3, 2, 2])
-  context.reply(1, 0)
+  const calls = Array.from({ length: 7 }, (_, index) => context.client.call('hold', [index]))
+  await context.started(7)
+  assert.deepEqual(context.workers.map(worker => worker.calls.length), [3, 2, 2])
+  context.workers[1]!.calls[0]!.resolve('done')
+  await calls[1]
   calls.push(context.client.call('hold', ['least-loaded']))
-  assert.deepEqual(context.workers.map(worker => worker.messages.length), [3, 3, 2])
-  assert.deepEqual((context.workers[1]!.messages[2] as { args: unknown[] }).args, ['least-loaded'])
-  context.replyAll()
+  await context.started(8)
+  assert.deepEqual(context.workers.map(worker => worker.calls.length), [3, 3, 2])
+  assert.deepEqual(context.workers[1]!.calls[2]!.args, ['least-loaded'])
+  context.resolveAll()
   await Promise.all(calls)
+  context.client.dispose()
+})
+
+test('remote rejections release the finished call without releasing other work', async () => {
+  const context = poolContext({ pool: 'unlimited' })
+  const first = context.client.call('hold', ['first'])
+  const rejection = assert.rejects(first, { name: 'RangeError', message: 'failed computation' })
+  const second = context.client.call('hold', ['second'])
+  await context.started(2)
+  context.workers[0]!.calls[0]!.reject(new RangeError('failed computation'))
+  await rejection
+  const third = context.client.call('hold', ['third'])
+  await context.started(3)
+  assert.equal(context.workers.length, 2)
+  assert.deepEqual(context.workers.map(worker => worker.calls.map(call => call.args)), [[['first'], ['third']], [['second']]])
+  context.resolveAll()
+  await Promise.all([second, third])
   context.client.dispose()
 })
 
 test('unlimited grows to peak concurrency and reuses retained workers', async () => {
   const context = poolContext({ pool: 'unlimited' })
   const firstBurst = Array.from({ length: 32 }, () => context.client.call('hold', []))
+  await context.started(32)
   assert.equal(context.workers.length, 32)
-  context.replyAll()
+  context.resolveAll()
   await Promise.all(firstBurst)
   assert.ok(context.workers.every(worker => worker.terminated === 0))
   const secondBurst = Array.from({ length: 9 }, () => context.client.call('hold', []))
+  await context.started(41)
   assert.equal(context.workers.length, 32)
-  context.replyAll()
+  context.resolveAll()
   await Promise.all(secondBurst)
   context.client.dispose()
   assert.ok(context.workers.every(worker => worker.terminated === 1))
 })
 
-test('wrong-worker, duplicate and malformed replies do not settle calls or alter pool occupancy', async () => {
-  const context = poolContext({ pool: 'unlimited' })
-  const first = context.client.call('hold', [])
-  const second = context.client.call('hold', [])
-  let firstSettled = false
-  void first.then(() => { firstSettled = true })
-  context.workers[1]!.emit('message', { data: context.response(0, 0, 'wrong worker') })
-  context.workers[0]!.emit('message', { data: { ...context.response(0, 0), ok: false, error: null } })
-  await Promise.resolve()
-  assert.equal(firstSettled, false)
-  const third = context.client.call('hold', [])
-  assert.equal(context.workers.length, 3, 'invalid responses must not make a worker idle')
-  context.reply(0, 0, 'correct worker')
-  assert.equal(await first, 'correct worker')
-  const fourth = context.client.call('hold', [])
-  assert.equal(context.workers.length, 3)
-  context.reply(0, 0, 'duplicate')
-  const fifth = context.client.call('hold', [])
-  assert.equal(context.workers.length, 4, 'a duplicate must not clear the newer request on its worker')
-  context.replyAll()
-  await Promise.all([second, third, fourth, fifth])
-  context.client.dispose()
-})
-
-test('timeouts retain actual worker occupancy until a matching late reply', async () => {
+test('timeouts retain actual worker occupancy until a late result arrives', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   const context = poolContext({ pool: 'unlimited', timeoutMs: 20 })
-  await assert.rejects(context.client.call('hold', []), { name: 'TimeoutError' })
-  const second = context.client.call('hold', [])
+  const timeout = assert.rejects(context.client.call('hold', ['timed out']), { name: 'TimeoutError' })
+  await context.started(1)
+  t.mock.timers.tick(20)
+  await timeout
+  const second = context.client.call('hold', ['second'])
+  await context.started(2)
   assert.equal(context.workers.length, 2, 'a timed-out computation is still busy')
-  context.reply(0, 0)
-  const third = context.client.call('hold', [])
-  assert.equal(context.workers.length, 2, 'the late reply makes that worker reusable')
-  assert.equal(context.workers[0]!.messages.length, 2)
-  context.reply(0, 0)
-  const fourth = context.client.call('hold', [])
-  assert.equal(context.workers.length, 3, 'duplicate late replies must not release newer work')
-  context.replyAll()
-  await Promise.all([second, third, fourth])
+  context.workers[0]!.calls[0]!.resolve('late result')
+  await nextTurn()
+  const third = context.client.call('hold', ['third'])
+  await context.started(3)
+  assert.equal(context.workers.length, 2, 'the late result makes that worker reusable')
+  assert.deepEqual(context.workers[0]!.calls[1]!.args, ['third'])
+  context.resolveAll()
+  await Promise.all([second, third])
   context.client.dispose()
 })
 
 test('argument clone errors release pool occupancy immediately', async () => {
   const context = poolContext({ pool: 'unlimited' })
   await assert.rejects(context.client.call('echo', [() => 1]), { name: 'DataCloneError' })
-  const next = context.client.call('echo', [42])
+  assert.equal(await context.client.call('echo', [42]), 42)
   assert.equal(context.workers.length, 1)
-  context.reply(0, 0, 42)
-  assert.equal(await next, 42)
   context.client.dispose()
 })
 
@@ -359,6 +439,7 @@ test('dispose rejects every pooled call and terminates every worker once', async
   const rejections = Array.from({ length: 8 }, () =>
     assert.rejects(context.client.call('hold', []), /disposed/),
   )
+  await context.started(8)
   context.client.dispose()
   await Promise.all(rejections)
   context.client.dispose()
@@ -366,7 +447,7 @@ test('dispose rejects every pooled call and terminates every worker once', async
   assert.equal(context.workers.length, 3)
   for (const worker of context.workers) {
     assert.equal(worker.terminated, 1)
-    for (const listeners of worker.listeners.values()) assert.equal(listeners.size, 0)
+    assertNoListeners(worker)
   }
 })
 
@@ -377,25 +458,36 @@ for (const event of ['error', 'messageerror']) {
     const rejections = Array.from({ length: 6 }, () =>
       assert.rejects(context.client.call('hold', []), expected),
     )
+    await context.started(6)
     context.workers[1]!.emit(event, { message: 'pool worker crashed' })
     await Promise.all(rejections)
     await assert.rejects(context.client.call('hold', []), expected)
-    assert.ok(context.workers.every(worker => worker.terminated === 1))
+    for (const worker of context.workers) {
+      assert.equal(worker.terminated, 1)
+      assertNoListeners(worker)
+    }
     context.client.dispose()
   })
 }
 
 test('a pool expansion failure also terminates previously created workers', async () => {
   const worker = new FakePort()
+  const server = new FakePort()
+  worker.peer = server
+  server.peer = worker
+  const started = deferred<void>()
+  exposeRpc({ hold: () => { started.resolve(); return new Promise(() => {}) } }, server as unknown as RpcEndpoint)
   let attempts = 0
   const client = createRpcClient(() => {
     if (++attempts > 1) throw new Error('cannot create another worker')
     return worker as unknown as RpcWorker
   }, { pool: 2 })
   const first = assert.rejects(client.call('hold', []), /cannot create another worker/)
+  await started.promise
   await assert.rejects(client.call('hold', []), /cannot create another worker/)
   await first
   assert.equal(worker.terminated, 1)
+  assertNoListeners(worker)
   client.dispose()
 })
 
@@ -418,8 +510,9 @@ for (const [concurrency, expected] of [
     t.after(replaceNavigator({ hardwareConcurrency: concurrency }))
     const context = poolContext({ pool: 'auto' })
     const calls = Array.from({ length: expected + 2 }, () => context.client.call('hold', []))
+    await context.started(expected + 2)
     assert.equal(context.workers.length, expected)
-    context.replyAll()
+    context.resolveAll()
     await Promise.all(calls)
     context.client.dispose()
   })
@@ -430,8 +523,9 @@ test('explicit and default auto fall back to four workers when navigator is abse
   for (const options of [undefined, {}, { pool: undefined }, { pool: 'auto' }] as const) {
     const context = poolContext(options)
     const calls = Array.from({ length: 6 }, () => context.client.call('hold', []))
+    await context.started(6)
     assert.equal(context.workers.length, 4)
-    context.replyAll()
+    context.resolveAll()
     await Promise.all(calls)
     context.client.dispose()
   }
@@ -451,9 +545,10 @@ test('explicit and default auto read hardwareConcurrency only on first call and 
     assert.equal(reads, 1)
     concurrency = 100
     calls.push(...Array.from({ length: 12 }, () => context.client.call('hold', [])))
+    await context.started(13)
     assert.equal(context.workers.length, 5)
     assert.equal(reads, 1)
-    context.replyAll()
+    context.resolveAll()
     await Promise.all(calls)
     context.client.dispose()
   }

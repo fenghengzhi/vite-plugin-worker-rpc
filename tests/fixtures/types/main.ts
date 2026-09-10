@@ -2,6 +2,16 @@ import { add as single } from './compute.rpc?pool=1'
 import { add as bounded } from './compute.rpc?pool=4'
 import { add as automatic } from './compute.rpc?pool=auto'
 import { add as unlimited, greet } from './compute.rpc?pool=unlimited'
+import {
+  applyCallback,
+  readProxiedObject,
+  createCounter,
+  createMultiplier,
+  cloneData,
+  collect,
+} from './compute.rpc?pool=auto'
+import { proxy, releaseProxy, transfer } from '../../../src/client.js'
+import { createEndpoint } from 'comlink'
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends
   (<T>() => T extends B ? 1 : 2) ? true : false
@@ -13,6 +23,7 @@ type BoundedResult = Expect<Equal<ReturnType<typeof bounded>, Promise<number>>>
 type AutoResult = Expect<Equal<ReturnType<typeof automatic>, Promise<number>>>
 type UnlimitedResult = Expect<Equal<ReturnType<typeof unlimited>, Promise<number>>>
 type AsyncResult = Expect<Equal<ReturnType<typeof greet>, Promise<string>>>
+type OptionalAndRest = Expect<Equal<Parameters<typeof collect>, [first: number, label?: string, ...values: number[]]>>
 
 const result: number = await automatic(1, 2)
 const pending: Promise<number> = bounded(1, 2)
@@ -31,3 +42,57 @@ unlimited(1, false)
 const incorrectGreeting: Promise<number> = greet('Ada')
 // @ts-expect-error Query declarations must not invent exported functions.
 import { absent } from './compute.rpc?pool=auto'
+
+const callbackResult: number = await applyCallback(proxy((value: number) => value * 2), 3)
+const asyncCallbackResult: number = await applyCallback(proxy(async (value: number) => value * 2), 3)
+const localObject = proxy({
+  value: 1,
+  increment(amount: number) {
+    this.value += amount
+    return this.value
+  },
+})
+const objectResult: number = await readProxiedObject(localObject)
+void [callbackResult, asyncCallbackResult, objectResult]
+
+// @ts-expect-error Proxied callback parameters retain their original types.
+applyCallback(proxy((value: string) => value.length), 3)
+// @ts-expect-error Proxied callback results retain their original types.
+applyCallback(proxy((value: number) => String(value)), 3)
+// @ts-expect-error Callback values must be explicitly marked for proxying.
+applyCallback((value: number) => value * 2, 3)
+// @ts-expect-error Proxied object methods retain their original parameter types.
+readProxiedObject(proxy({ value: 1, increment(amount: string) { return amount.length } }))
+
+const counter = await createCounter(1)
+type RemoteProperty = Expect<Equal<typeof counter.value, Promise<number>>>
+type RemoteMethodResult = Expect<Equal<ReturnType<typeof counter.increment>, Promise<number>>>
+const count: number = await counter.value
+const incremented: number = await counter.increment(2)
+counter[releaseProxy]()
+void [count, incremented]
+
+const multiplier = await createMultiplier(3)
+type RemoteFunctionResult = Expect<Equal<ReturnType<typeof multiplier>, Promise<number>>>
+const multiplied: number = await multiplier(4)
+multiplier[releaseProxy]()
+void multiplied
+
+// @ts-expect-error Returned remote properties need to be awaited.
+const synchronousProperty: number = counter.value
+// @ts-expect-error Returned proxy methods preserve their argument types.
+counter.increment('2')
+// @ts-expect-error Returned proxy functions preserve their argument types.
+multiplier('4')
+// @ts-expect-error Module exports are plain pool wrappers, not Comlink proxies.
+automatic[releaseProxy]()
+// @ts-expect-error Pool wrappers do not expose Comlink endpoint creation.
+createCounter[createEndpoint]()
+
+const bytes = new Uint8Array([1, 2, 3])
+const data = await cloneData(transfer({ count: 1, bytes, dates: new Map([['today', new Date()]]) }, [bytes.buffer]))
+type ClonedProperty = Expect<Equal<typeof data.count, number>>
+type ClonedBytes = Expect<Equal<typeof data.bytes, Uint8Array>>
+type ClonedMap = Expect<Equal<typeof data.dates, Map<string, Date>>>
+// @ts-expect-error A cloned object is not a remote proxy.
+data[releaseProxy]()

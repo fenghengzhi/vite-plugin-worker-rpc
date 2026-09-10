@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-worker-rpc",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Import named functions from .rpc modules and run them in Web Workers automatically.",
   "type": "module",
   "license": "MIT",
@@ -30,6 +30,10 @@
     "./runtime": {
       "types": "./dist/runtime.d.ts",
       "import": "./dist/runtime.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
     }
   },
   "main": "./dist/index.js",
@@ -48,7 +52,8 @@
   },
   "dependencies": {
     "@babel/parser": "^7.28.0",
-    "@rollup/pluginutils": "^5.4.0"
+    "@rollup/pluginutils": "^5.4.0",
+    "comlink": "4.4.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -62,7 +67,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "test:unit": "tsx --test tests/exports.test.ts tests/runtime.test.ts tests/pool-query.test.ts tests/declarations.test.ts tests/release.test.ts",
-    "test:integration": "tsx --test tests/integration.test.ts tests/pool-integration.test.ts tests/plugin-review.test.ts tests/pool-review.test.ts tests/project-defaults.test.ts",
+    "test:integration": "tsx --test tests/integration.test.ts tests/pool-integration.test.ts tests/plugin-review.test.ts tests/pool-review.test.ts tests/project-defaults.test.ts tests/comlink-integration.test.ts",
     "check": "npm run typecheck && npm run build && npm test",
     "dev": "vite playground",
     "build:playground": "vite build playground",
