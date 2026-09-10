@@ -30,7 +30,8 @@ test('pool resolution preserves native asset queries and canonicalizes symlink i
       assert.equal(linked?.id, direct?.id)
       assert.equal(alias?.id, direct?.id, `alias query ${pool}`)
     }
-    assert.equal((await container.resolveId('./compute.rpc?pool=1', join(root, 'main.ts')))?.id, rpc)
+    assert.equal((await container.resolveId('./compute.rpc?pool=auto', join(root, 'main.ts')))?.id, rpc)
+    assert.equal((await container.resolveId('./compute.rpc?pool=1', join(root, 'main.ts')))?.id, `${rpc}?pool=1`)
     const raw = await server.transformRequest('/compute.rpc.ts?raw')
     assert.match(raw!.code, /export default/)
     assert.match(raw!.code, /export function add/)

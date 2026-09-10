@@ -8,7 +8,7 @@ const internalQueries = new Set(['t', 'v', 'import'])
 /** null denotes a Vite asset request, not an RPC import. */
 export function parsePoolQuery(id: string): RpcPoolMode | null {
   const index = id.indexOf('?')
-  if (index < 0) return 1
+  if (index < 0) return 'auto'
   const params = new URLSearchParams(id.slice(index + 1))
   const fail = (reason: string): never => {
     throw new Error(`[vite-plugin-worker-rpc] ${id}: ${reason} Use ?pool=1, ?pool=N, ?pool=auto or ?pool=unlimited.`)
@@ -23,7 +23,7 @@ export function parsePoolQuery(id: string): RpcPoolMode | null {
   for (const key of keys) {
     if (key !== 'pool' && !internalQueries.has(key)) fail(`Unknown RPC parameter "${key}".`)
   }
-  if (!values.length) return 1
+  if (!values.length) return 'auto'
   const value = values[0]!
   if (value === 'auto' || value === 'unlimited') return value
   if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
@@ -32,7 +32,7 @@ export function parsePoolQuery(id: string): RpcPoolMode | null {
   return Number(value)
 }
 
-/** Omitted pool and pool=1 intentionally resolve to the same ESM module. */
+/** Omitted pool and pool=auto intentionally resolve to the same ESM module. */
 export function poolModuleId(filename: string, pool: RpcPoolMode): string {
-  return pool === 1 ? filename : `${filename}?pool=${pool}`
+  return pool === 'auto' ? filename : `${filename}?pool=${pool}`
 }

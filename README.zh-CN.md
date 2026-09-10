@@ -48,7 +48,7 @@ import { add } from './compute.rpc'
 console.log(await add(1, 2)) // 3
 ```
 
-第一次调用时才会创建 Worker。默认情况下，同一个模块的所有导出共享一个 Worker 和模块状态。仅导入模块不会创建 Worker。`async` 函数内部的同步计算仍然在 Worker 线程执行。
+第一次调用时才会创建 Worker。默认情况下，同一个模块的所有导出共享一个自动决定上限的 Worker 池，每个 Worker 拥有独立的模块状态。仅导入模块不会创建 Worker。`async` 函数内部的同步计算仍然在 Worker 线程执行。如果调用必须共享一个 Worker 和模块状态，请使用 `?pool=1`。
 
 ## Worker 池
 
@@ -68,16 +68,18 @@ TypeScript 中带 query 的导入需要显式模块声明，详见 [TypeScript �
 
 | 导入方式 | 池内 Worker 数量上限 |
 | --- | --- |
-| `./compute.rpc` 或 `./compute.rpc?pool=1` | 一个共享 Worker，两种导入使用同一个池。 |
+| `./compute.rpc` 或 `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`；硬件值缺失或不是大于 `0` 的安全整数时回退为 `4`。两种导入共享默认池。 |
+| `./compute.rpc?pool=1` | 一个共享 Worker，使用与默认池独立的池。 |
 | `./compute.rpc?pool=N` | 大于 `0` 的安全整数 `N`。 |
-| `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`；硬件值缺失或不是大于 `0` 的安全整数时回退为 `4`。 |
 | `./compute.rpc?pool=unlimited` | 不设固定上限。 |
 
 所有池都按需增长：调用优先复用空闲 Worker；全部忙碌且尚未达到上限时，才创建新 Worker。达到上限后，调用会立即发给实际未完成请求最少的 Worker，不在主线程排队。同一个 Worker 中的 CPU 密集型计算仍在同一线程运行；异步调用可以在该 Worker 中交错执行。
 
 `auto` 在池首次被调用时读取硬件值，之后固定这个上限，没有额外的固定最大值。`unlimited` 同样会复用空闲 Worker；池忙碌时可以持续增长，已创建的 Worker 会保留到池被释放或页面重新加载，不会在空闲时自动缩减。
 
-池的身份由解析后的源模块和规范化后的池模式共同决定。不同文件中的导入、路径别名，只要解析到相同源模块和相同模式，就共享一个池。无 query 的导入与 `pool=1` 共用一个池。其他模式彼此独立：即使 `auto` 算出的上限恰好等于某个显式数值，两者也不会合并。上限作用于每个模块的每种模式，不是整个应用的全局 CPU 预算。
+池的身份由解析后的源模块和规范化后的池模式共同决定。不同文件中的导入、路径别名，只要解析到相同源模块和相同模式，就共享一个池。无 query 的导入与 `pool=auto` 共用一个池。包括 `pool=1` 在内的显式数值模式使用独立的池：即使 `auto` 算出的上限恰好等于某个显式数值，两者也不会合并。上限作用于每个模块的每种模式，不是整个应用的全局 CPU 预算。
+
+迁移提示：如果需要保留之前无 query 导入时的单 Worker 行为，请在导入路径后添加 `?pool=1`。
 
 每个 Worker 都有独立的模块状态。池内的调用可能被分发到不同 Worker，因此不能假设模块级计数器、缓存或可变变量在全部调用间共享。超时会拒绝调用者的 Promise，但不会停止请求，也不会在实际响应到达前把对应 Worker 当作空闲。
 

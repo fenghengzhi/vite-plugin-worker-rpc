@@ -48,7 +48,7 @@ import { add } from './compute.rpc'
 console.log(await add(1, 2)) // 3
 ```
 
-The first call starts a Worker. By default, all exports from the same module share one Worker and its module state. Importing alone does not start one. Synchronous computation inside an `async` export still runs on the Worker thread.
+The first call starts a Worker. By default, all exports from the same module share an automatically sized Worker pool; each Worker has its own module state. Importing alone does not start one. Synchronous computation inside an `async` export still runs on the Worker thread. Use `?pool=1` when calls must share one Worker and its module state.
 
 ## Worker pools
 
@@ -68,16 +68,18 @@ TypeScript query imports need an explicit module declaration; see [TypeScript](#
 
 | Import | Maximum Workers in the pool |
 | --- | --- |
-| `./compute.rpc` or `./compute.rpc?pool=1` | One shared Worker; these imports use the same pool. |
+| `./compute.rpc` or `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`; falls back to `4` if the hardware value is missing or is not a positive safe integer. These imports share the default pool. |
+| `./compute.rpc?pool=1` | One shared Worker, in a pool separate from the default. |
 | `./compute.rpc?pool=N` | A positive safe integer `N`. |
-| `./compute.rpc?pool=auto` | `Math.max(1, navigator.hardwareConcurrency - 1)`; falls back to `4` if the hardware value is missing or is not a positive safe integer. |
 | `./compute.rpc?pool=unlimited` | No fixed maximum. |
 
 Pools grow lazily: each call first reuses an idle Worker, then creates a Worker if below the maximum. At the maximum, it immediately sends the call to the Worker with the fewest actual unfinished requests. There is no main-thread task queue. CPU-bound work on one Worker still runs on one thread; asynchronous calls may interleave within that Worker.
 
 `auto` reads the hardware value on the pool's first call, then keeps that maximum. It has no additional fixed cap. `unlimited` reuses idle Workers too; a busy pool can grow without a fixed bound and retains its peak Worker count until disposal or a page reload.
 
-Pool identity is the resolved source module plus its canonical pool mode. Imports from different files or through aliases share a pool when they resolve to the same source and mode. The unqueried import and `pool=1` share a pool. Other modes use separate pools: `auto` stays separate from an explicit numeric mode even when their maxima happen to match. Limits apply per module and mode, not as a global CPU budget for the application.
+Pool identity is the resolved source module plus its canonical pool mode. Imports from different files or through aliases share a pool when they resolve to the same source and mode. The unqueried import and `pool=auto` share a pool. Explicit numeric modes, including `pool=1`, use separate pools: `auto` stays separate from a numeric mode even when their maxima happen to match. Limits apply per module and mode, not as a global CPU budget for the application.
+
+Migration: to preserve the previous single-Worker behavior of an unqueried import, add `?pool=1` to its import path.
 
 Every Worker has its own module state. Calls may move between Workers in a pool, so do not rely on a module-level counter, cache, or mutable variable being shared across all calls. A timeout rejects the caller but does not stop the request or make its Worker idle before the actual response arrives.
 

@@ -70,8 +70,8 @@ const workerIds = (starts: Start[]) => [...new Set(starts.map((item) => item.id)
 
 async function checkSharingAndLimits(page: Page): Promise<void> {
   assert.equal(await workerCount(page), 0, 'importing all pool variants must remain lazy')
-  const one = await heldBatch(page, ['defaultHold', 'oneHold', 'aliasOneHold'])
-  assert.equal(workerIds(one.starts).length, 1, 'default, pool=1, and alias imports must share one worker')
+  const one = await heldBatch(page, ['oneHold', 'oneHold', 'aliasOneHold'])
+  assert.equal(workerIds(one.starts).length, 1, 'explicit pool=1 and alias imports must share one worker')
   assert.deepEqual(one.starts.map((item) => item.activeAtStart).sort(), [1, 2, 3])
   assert.equal(await workerCount(page), 1)
 
@@ -98,6 +98,11 @@ async function checkSharingAndLimits(page: Page): Promise<void> {
   assert.equal(await workerCount(page), 10, 'unlimited pools should reuse workers from the previous peak')
   await heldBatch(page, ['unlimitedHold'])
   assert.equal(await workerCount(page), 10)
+
+  const automatic = await heldBatch(page, ['defaultHold', 'autoHold', 'aliasAutoHold', 'defaultHold', 'autoHold', 'aliasAutoHold'])
+  assert.equal(workerIds(automatic.starts).length, 3, 'default and explicit auto share the hardware-sized pool')
+  assert.equal(await workerCount(page), 13, 'auto remains independent of the explicit single-worker pool')
+  assert.ok(!workerIds(automatic.starts).includes(workerIds(one.starts)[0]!))
 }
 
 async function checkAuto(browser: Browser, url: string): Promise<void> {
@@ -112,7 +117,7 @@ async function checkAuto(browser: Browser, url: string): Promise<void> {
     try {
       assert.equal(await workerCount(page), 0)
       await page.evaluate((value) => Object.defineProperty(navigator, 'hardwareConcurrency', { configurable: true, value }), firstCall)
-      const first = await heldBatch(page, Array(cap + 2).fill('autoHold'))
+      const first = await heldBatch(page, Array(cap + 2).fill('defaultHold'))
       assert.equal(workerIds(first.starts).length, cap, `auto cap for hardwareConcurrency=${String(firstCall)}`)
       assert.equal(await workerCount(page), cap)
       await page.evaluate(() => Object.defineProperty(navigator, 'hardwareConcurrency', { configurable: true, value: 32 }))
@@ -224,8 +229,10 @@ test('queried RPC modules remain safe to import during SSR', { timeout: 15_000 }
     const server = await createServer({ root: fixtureRoot, configFile: false, logLevel: 'silent', plugins: [workerRpc()], server: { middlewareMode: true } })
     closeServer = () => server.close()
     const defaultApi = await server.ssrLoadModule('/compute.rpc.ts')
+    const autoApi = await server.ssrLoadModule('/compute.rpc.ts?pool=auto')
     const oneApi = await server.ssrLoadModule('/compute.rpc.ts?pool=1')
-    assert.equal(defaultApi.add, oneApi.add, 'default and explicit pool=1 resolve to one module')
+    assert.equal(defaultApi.add, autoApi.add, 'default and explicit auto resolve to one module')
+    assert.notEqual(defaultApi.add, oneApi.add, 'explicit pool=1 remains a separate module')
     for (const pool of ['1', '2', 'auto', 'unlimited']) {
       const api = await server.ssrLoadModule(`/compute.rpc.ts?pool=${pool}`)
       assert.equal(typeof api.add, 'function')

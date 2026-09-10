@@ -3,14 +3,15 @@ import { test } from 'node:test'
 import { parsePoolQuery, poolModuleId } from '../src/pool-query.js'
 
 test('recognizes pool modes and Vite internal metadata', () => {
-  assert.equal(parsePoolQuery('/compute.rpc.ts'), 1)
+  assert.equal(parsePoolQuery('/compute.rpc.ts'), 'auto')
+  assert.equal(parsePoolQuery('/compute.rpc.ts?import&t=123'), 'auto')
   assert.equal(parsePoolQuery('/compute.rpc.ts?pool=1'), 1)
   assert.equal(parsePoolQuery('/compute.rpc.ts?pool=12'), 12)
   assert.equal(parsePoolQuery('/compute.rpc.ts?pool=auto'), 'auto')
   assert.equal(parsePoolQuery('/compute.rpc.ts?pool=unlimited'), 'unlimited')
   assert.equal(parsePoolQuery('/compute.rpc.ts?import&pool=3&t=123'), 3)
-  assert.equal(poolModuleId('/compute.rpc.ts', 1), '/compute.rpc.ts')
-  assert.equal(poolModuleId('/compute.rpc.ts', 'auto'), '/compute.rpc.ts?pool=auto')
+  assert.equal(poolModuleId('/compute.rpc.ts', 1), '/compute.rpc.ts?pool=1')
+  assert.equal(poolModuleId('/compute.rpc.ts', 'auto'), '/compute.rpc.ts')
 })
 
 test('preserves Vite raw, URL and Worker imports', () => {

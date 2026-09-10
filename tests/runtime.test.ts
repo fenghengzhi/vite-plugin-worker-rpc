@@ -45,11 +45,11 @@ function pair(api: object, options: { timeoutMs?: number } = {}) {
   const client = createRpcClient(() => {
     created++
     return worker as unknown as RpcWorker
-  }, options)
+  }, { ...options, pool: 1 })
   return { worker, server, client, cleanup, get created() { return created } }
 }
 
-function poolContext(options: RpcClientOptions = {}) {
+function poolContext(options?: RpcClientOptions) {
   const workers: FakePort[] = []
   const client = createRpcClient(() => {
     const worker = new FakePort()
@@ -425,30 +425,36 @@ for (const [concurrency, expected] of [
   })
 }
 
-test('auto falls back to four workers when navigator is absent', async (t) => {
+test('explicit and default auto fall back to four workers when navigator is absent', async (t) => {
   t.after(replaceNavigator(undefined))
-  const context = poolContext({ pool: 'auto' })
-  const calls = Array.from({ length: 6 }, () => context.client.call('hold', []))
-  assert.equal(context.workers.length, 4)
-  context.replyAll()
-  await Promise.all(calls)
-  context.client.dispose()
+  for (const options of [undefined, {}, { pool: undefined }, { pool: 'auto' }] as const) {
+    const context = poolContext(options)
+    const calls = Array.from({ length: 6 }, () => context.client.call('hold', []))
+    assert.equal(context.workers.length, 4)
+    context.replyAll()
+    await Promise.all(calls)
+    context.client.dispose()
+  }
 })
 
-test('auto reads hardwareConcurrency only on first call and freezes that limit', async (t) => {
+test('explicit and default auto read hardwareConcurrency only on first call and freeze that limit', async (t) => {
   let reads = 0
   let concurrency = 2
   t.after(replaceNavigator({ get hardwareConcurrency() { reads++; return concurrency } }))
-  const context = poolContext({ pool: 'auto' })
-  assert.equal(reads, 0, 'client construction must not read browser globals')
-  concurrency = 6
-  const calls = [context.client.call('hold', [])]
-  assert.equal(reads, 1)
-  concurrency = 100
-  calls.push(...Array.from({ length: 12 }, () => context.client.call('hold', [])))
-  assert.equal(context.workers.length, 5)
-  assert.equal(reads, 1)
-  context.replyAll()
-  await Promise.all(calls)
-  context.client.dispose()
+  for (const options of [undefined, {}, { pool: undefined }, { pool: 'auto' }] as const) {
+    reads = 0
+    concurrency = 2
+    const context = poolContext(options)
+    assert.equal(reads, 0, 'client construction must not read browser globals')
+    concurrency = 6
+    const calls = [context.client.call('hold', [])]
+    assert.equal(reads, 1)
+    concurrency = 100
+    calls.push(...Array.from({ length: 12 }, () => context.client.call('hold', [])))
+    assert.equal(context.workers.length, 5)
+    assert.equal(reads, 1)
+    context.replyAll()
+    await Promise.all(calls)
+    context.client.dispose()
+  }
 })

@@ -17,7 +17,7 @@ export interface RpcWorker extends RpcEndpoint {
 export type RpcPoolMode = number | 'auto' | 'unlimited'
 
 export interface RpcClientOptions {
-  /** Maximum workers, or a lazily resolved strategy. Defaults to one worker. */
+  /** Maximum workers, or a lazily resolved strategy. Defaults to "auto". */
   pool?: RpcPoolMode
   /** Per-call timeout in milliseconds. Zero (the default) disables the timeout. */
   timeoutMs?: number
@@ -86,7 +86,7 @@ function toError(value: unknown): Error {
  */
 export function createRpcClient(
   factory: () => RpcWorker,
-  { pool = 1, timeoutMs = 0 }: RpcClientOptions = {},
+  { pool = 'auto', timeoutMs = 0 }: RpcClientOptions = {},
 ): RpcClient {
   if (pool !== 'auto' && pool !== 'unlimited' &&
       !(typeof pool === 'number' && Number.isSafeInteger(pool) && pool > 0)) {

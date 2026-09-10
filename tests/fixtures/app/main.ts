@@ -7,7 +7,7 @@ import {
   inspectRuntime,
   sourceVersion,
   renamed,
-} from './compute.rpc'
+} from './compute.rpc?pool=1'
 import { subtract } from './plain.rpc.js'
 
 Object.assign(window, {
