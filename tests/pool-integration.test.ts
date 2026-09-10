@@ -226,15 +226,19 @@ test('queried RPC modules remain safe to import during SSR', { timeout: 15_000 }
   let closeServer: (() => Promise<void>) | undefined
   try {
     await writeFile(join(fixtureRoot, 'compute.rpc.ts'), 'throw new Error("RPC source must not run during SSR"); export function add(a: number, b: number) { return a + b }')
+    for (const pool of ['default', '1', '2', 'auto', 'unlimited']) {
+      const source = `./compute.rpc${pool === 'default' ? '' : `?pool=${pool}`}`
+      await writeFile(join(fixtureRoot, `consumer-${pool}.ts`), `export { add } from ${JSON.stringify(source)}`)
+    }
     const server = await createServer({ root: fixtureRoot, configFile: false, logLevel: 'silent', plugins: [workerRpc()], server: { middlewareMode: true } })
     closeServer = () => server.close()
-    const defaultApi = await server.ssrLoadModule('/compute.rpc.ts')
-    const autoApi = await server.ssrLoadModule('/compute.rpc.ts?pool=auto')
-    const oneApi = await server.ssrLoadModule('/compute.rpc.ts?pool=1')
+    const defaultApi = await server.ssrLoadModule('/consumer-default.ts')
+    const autoApi = await server.ssrLoadModule('/consumer-auto.ts')
+    const oneApi = await server.ssrLoadModule('/consumer-1.ts')
     assert.equal(defaultApi.add, autoApi.add, 'default and explicit auto resolve to one module')
     assert.notEqual(defaultApi.add, oneApi.add, 'explicit pool=1 remains a separate module')
     for (const pool of ['1', '2', 'auto', 'unlimited']) {
-      const api = await server.ssrLoadModule(`/compute.rpc.ts?pool=${pool}`)
+      const api = await server.ssrLoadModule(`/consumer-${pool}.ts`)
       assert.equal(typeof api.add, 'function')
       await assert.rejects(api.add(1, 2), /browser.*Web Worker.*SSR/)
     }

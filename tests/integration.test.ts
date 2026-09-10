@@ -251,7 +251,8 @@ test('SSR can import RPC proxies without executing their source, but calling rep
       server: { middlewareMode: true },
     })
     closeServer = () => server.close()
-    const api = await server.ssrLoadModule('/ssr.rpc.ts')
+    await writeFile(join(fixtureRoot, 'consumer.ts'), "export { add } from './ssr.rpc'")
+    const api = await server.ssrLoadModule('/consumer.ts')
     assert.equal(typeof api.add, 'function')
     await assert.rejects(api.add(1, 2), /browser.*Web Worker.*SSR/)
   } finally {

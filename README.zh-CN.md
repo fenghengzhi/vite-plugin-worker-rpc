@@ -114,7 +114,7 @@ const api = implementation as unknown as Remote<typeof implementation>
 const result = await api.add(1, 2)
 ```
 
-`Remote<T>` 使用 Comlink 的参数与结果映射描述生成模块的导出函数，包括用 `proxy()` 标记的值。它仅用于类型标注，不会再包一层运行时代理。带回调参数或返回代理的 API 也应使用它：仅写 `async` 无法描述这些值跨线程后的类型变化。未标记的参数和结果必须支持结构化克隆。
+`Remote<T>` 使用 Comlink 的参数与结果映射描述生成模块的导出函数，直接回调参数可以传普通函数，也兼容显式用 `proxy()` 标记的值。它仅用于类型标注，不会再包一层运行时代理。带回调参数或返回代理的 API 也应使用它：仅写 `async` 无法描述这些值跨线程后的类型变化。其他未标记的参数和结果必须支持结构化克隆。
 
 ### 带 query 的导入声明
 
@@ -143,7 +143,7 @@ const result: number = await add(1, 2)
 
 ## 导出与执行规则
 
-支持本地声明的具名函数、值为函数的变量、这些函数的导出别名，以及纯类型声明：
+RPC 实现使用普通 ESM 导出。函数可以在本地声明、赋给变量、导入后再导出，或直接从其他模块重新导出，也支持纯类型声明：
 
 ```ts
 export interface Input { value: number }
@@ -154,9 +154,49 @@ export async function double(input: Input) {
 
 const triple = async (value: number) => value * 3
 export { triple as multiplyByThree }
+
+export { add } from './math'
+export * from './more-functions'
 ```
 
-默认导出、导出的运行时值或类、生成器函数、运行时重新导出和 `export *` 会触发构建错误。需要导出外部函数时，用本地函数包装；共享常量放到普通模块。可以保留未导出的模块状态。
+插件不在构建时枚举或校验实现模块的导出，而是在调用到达 Worker 后按名称查找。调用不存在的导出或非函数导出时，Promise 会以 `TypeError` 拒绝。类不能按普通函数调用，生成器的返回值不支持结构化克隆。导出的常量保留在 Worker 中，浏览器代理不提供这些值；两端都需要的常量请放到普通共享模块。
+
+### 导入方式与生成模块
+
+继续使用具名导入、导入别名或命名空间导入：
+
+```ts
+import { add as sum } from './compute.rpc'
+import * as compute from './compute.rpc'
+
+await sum(1, 2)
+await compute.add(1, 2)
+```
+
+插件生成一个带动态 `Proxy` 的浏览器模块，以及一个导入原始实现的 Worker 入口。连同原始实现，共三个逻辑模块；最终输出文件数由 Vite 的打包决定。浏览器模块还提供一个固定的内部导出，供动态导入使用，不会为每个 RPC 函数逐一生成导出，也不会修改实现中的函数体。
+
+另一个转换步骤把调用方的导入改写为浏览器代理的属性访问。它读取调用方请求的名称，不扫描 RPC 实现的导出列表。代理在访问时生成对应方法，并通过 Worker 池发送调用。直接传入的函数参数会分别自动代理，整个参数数组不会变成远程引用。
+
+应用模块可以使用具名重新导出和命名空间重新导出：
+
+```ts
+// src/api.ts
+export { add, multiplyByThree as triple } from './compute.rpc'
+export * as compute from './compute.rpc'
+```
+
+调用方的 `export * from './compute.rpc'` 需要枚举 RPC 导出，因此会被拒绝；请列出具体名称，或改用 `export * as compute`。这一限制不影响原始 Worker 实现内部的重新导出，例如上面的 `export * from './more-functions'`。
+
+调用方的具名导入和重新导出会把缓存的代理方法绑定到本地变量，并非指向 Worker 导出的原生实时绑定。如果调用方通过导入或重新导出形成循环依赖，在模块初始化期间提前调用，可能因这些变量尚未初始化而触发暂时性死区错误。请打破循环，或把调用推迟到模块初始化完成后。原始 Worker 实现内部的依赖仍遵循普通 ESM 语义。
+
+也支持路径为字面量的动态导入：
+
+```ts
+const compute = await import('./compute.rpc')
+await compute.add(1, 2)
+```
+
+请使用字面量路径，不支持路径依赖运行时变量的动态导入。静态或动态导入得到的命名空间/API 对象都会隐藏 `then`，避免 Promise 解析过程误调用 RPC 导出；调用名为 `then` 的函数时，请使用 `import { then as runThen } from './compute.rpc'` 这样的具名导入。命名空间代理提供方法访问，不提供导出发现功能：不要用 `Object.keys`、`for...in` 或 `in` 枚举或判断可用导出。纯类型导入保持为类型用途，不会启动 Worker。
 
 实现及其导入依赖都在 Worker 中执行。一个 RPC 实现通过本地依赖引用另一个 RPC 模块时，即使路径包含 `?pool=...`，后者也会作为当前 Worker 的普通本地依赖执行，不会产生嵌套 Worker 池或 RPC 调用。依赖必须兼容 Worker 环境：没有 `window` 和 DOM，也不能使用仅适用于 Node.js 的 API。模块在每个 Worker 启动时分别初始化一次，而不是在主线程导入代理时初始化。
 
@@ -166,18 +206,14 @@ export { triple as multiplyByThree }
 
 ### 回调参数
 
-通过 `proxy()` 标记回调。回调仍在创建它的线程执行，Worker 通过异步调用访问它，可以等待其返回值或捕获其异常。
+直接传入回调即可，插件会自动代理函数参数。回调仍在创建它的线程执行，Worker 通过异步调用访问它，可以等待其返回值或捕获其异常。同步和异步回调都支持。
 
 ```ts
 // src/compute.rpc.ts
-import { releaseProxy, type RemoteProxy } from 'vite-plugin-worker-rpc/client'
+import type { RemoteProxy } from 'vite-plugin-worker-rpc/client'
 
 export async function calculate(value: number, callback: RemoteProxy<(n: number) => number>) {
-  try {
-    return await callback(value)
-  } finally {
-    callback[releaseProxy]() // 本次调用已完成对这个远程引用的使用。
-  }
+  return await callback(value)
 }
 ```
 
@@ -185,13 +221,25 @@ export async function calculate(value: number, callback: RemoteProxy<(n: number)
 // src/main.ts
 import * as implementation from './compute.rpc'
 import type { Remote } from 'vite-plugin-worker-rpc'
-import { proxy } from 'vite-plugin-worker-rpc/client'
-
 const api = implementation as unknown as Remote<typeof implementation>
-const result = await api.calculate(21, proxy((n: number) => n * 2)) // 42
+const result = await api.calculate(21, n => n * 2) // 42；n 自动推断为 number。
 ```
 
-`RemoteProxy<T>` 描述接收方得到的异步 Comlink 引用，并保留参数类型推导需要的代理标记。`proxy()` 标记的是发送方的原始值，不会在本地把它变成远程引用。应在接收方最后一次使用完成后，对收到的引用调用 `[releaseProxy]()`。如果多个操作共享同一个收到的引用，需要等它们全部完成后再释放。同一个原始回调被多次传入 RPC 时，每次传输都会创建独立的 Comlink 端点，各接收方释放自己的引用不会使其他次传输失效。
+`RemoteProxy<T>` 描述接收方得到的异步 Comlink 引用，`Remote<T>` 将这个参数映射为发送方的普通回调。自动包装不会修改原始函数，也支持冻结的回调。显式 `proxy(fn)` 仍然可用，已由自定义 transfer handler 处理的函数保留该 handler 的行为。
+
+自动包装仅作用于生成的 RPC 导出函数的直接参数。对象或数组内部的函数、返回的函数，以及调用返回的 Comlink 引用的方法时传入的参数，仍需显式处理。自动回调只暴露函数调用行为；需要访问函数附加属性时，请使用显式代理。如果回调需要特定的 `this`，请先绑定方法再传入。
+
+在现代浏览器中，收到的回调不再被引用后，Comlink 可以通过 `FinalizationRegistry` 自动回收。上面的例子可以依赖这一机制，但回收并不立即发生。插件不会在 RPC 调用结束时主动释放回调，因此 Worker 也可以有意保存回调供后续使用。如果需要及时清理，请在 Worker 中导入 `releaseProxy`，并在最后一次使用完成后释放收到的引用：
+
+```ts
+try {
+  return await callback(value)
+} finally {
+  callback[releaseProxy]()
+}
+```
+
+如果多个操作共享同一个收到的引用，需要等它们全部完成后再释放。同一个原始回调被多次传入 RPC 时，每次传输都会创建独立的 Comlink 端点，各接收方释放自己的引用不会使其他次传输失效。
 
 ### 转移所有权，避免复制
 
@@ -256,9 +304,9 @@ try {
 
 Comlink 的 `transferHandlers` 可以支持额外的值类型。每个 handler 必须在**调用前，以同一个名称注册到两端**。例如，将注册代码放在普通共享模块中，从 `vite-plugin-worker-rpc/client` 导入 `transferHandlers`，再由主线程入口和 RPC 实现分别导入这个模块。`canHandle`、`serialize` 和 `deserialize` 的约定见 [Comlink transfer handler 文档](https://github.com/GoogleChromeLabs/comlink#transfer-handlers-and-event-listeners)。
 
-Comlink 处理直接参数与直接返回值，不会递归地对嵌套属性应用这些辅助函数或 handler。例如，`{ callback: proxy(fn) }` 不会自动成为受支持的回调参数；请把 `proxy(fn)` 作为独立参数传入，代理整个外层对象，或为外层值提供 handler。DOM 节点和未标记的函数不支持结构化克隆。
+Comlink 处理直接参数与直接返回值，不会递归地对嵌套属性应用这些辅助函数或 handler。例如，`{ callback: fn }` 和 `{ callback: proxy(fn) }` 都不会自动成为受支持的回调参数；请把 `fn` 作为独立参数传入，代理整个外层对象，或为外层值提供 handler。DOM 节点，以及不在直接参数自动处理范围内的未标记函数，不支持结构化克隆。
 
-应用需要管理收到的回调引用和返回对象引用的生命周期，在最后一次使用后释放，包括出错路径；垃圾回收不能保证确定的清理时机。停止池会清理池内 Worker 及池自身的传输资源，不保证自动清理应用代码持有的所有回调通道或返回代理。超时不会释放这些引用，也不会取消计算。
+应用需要管理收到的回调引用和返回对象引用的生命周期。现代浏览器支持 Comlink 自动回收不可达的代理；需要及时清理时，在最后一次使用后显式释放，包括出错路径。停止池会清理池内 Worker 及池自身的传输资源，不保证自动清理应用代码持有的所有回调通道或返回代理。超时不会释放这些引用，也不会取消计算。
 
 ## 配置
 
@@ -295,7 +343,7 @@ export default defineConfig({
 ## 运行行为与限制
 
 - 调用始终返回 Promise，并发请求分别匹配自己的结果，完成顺序可能与调用顺序不同。池的调度不保证连续调用会进入同一个 Worker。
-- Comlink 默认通过结构化克隆序列化参数和结果；显式的数据转移、回调代理、远程对象或自定义 handler 使用上文的 client 辅助函数。
+- 直接传入的函数参数会自动代理，其他参数和结果默认由 Comlink 进行结构化克隆。显式数据转移、远程对象、返回的函数或自定义 handler 使用上文的 client 辅助函数。
 - Comlink 负责传递远程异常。抛出的 `Error` 保留名称、消息，以及可用时的堆栈，不保留自定义属性和原型。支持结构化克隆的非 `Error` 抛出值仍然保持为非 `Error` 值。
 - 超时会拒绝调用者的 Promise，**不会取消计算**，实际响应到达前该请求仍计入未完成请求数。致命的 Worker 传输故障会停止整个池、拒绝池内所有待处理调用，并使其代理在页面重新加载前无法继续使用。导出函数抛出的异常只会拒绝对应调用。
 - SSR 阶段可以导入 RPC 模块；在没有浏览器 Worker 支持的环境中调用会拒绝，没有服务端执行回退。
@@ -319,7 +367,7 @@ npm run check
 npm run build:playground
 ```
 
-测试覆盖导出校验、RPC 传输，以及真实 Chromium Worker 中的 Vite 开发和生产流程，包括非根路径部署和开发刷新。CI 使用 Node.js 22，分别测试 Vite 6、7、8。
+测试覆盖导入改写、运行时导出分发、RPC 传输，以及真实 Chromium Worker 中的 Vite 开发和生产流程，包括非根路径部署和开发刷新。CI 使用 Node.js 22，分别测试 Vite 6、7、8。
 
 ## 发布版本
 

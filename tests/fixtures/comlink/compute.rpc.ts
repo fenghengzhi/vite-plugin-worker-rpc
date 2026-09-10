@@ -21,6 +21,17 @@ export async function callbackValue(callback: (value: number, worker: string) =>
   }
 }
 
+export function retainCallback(callback: (value: number) => Promise<number>) {
+  return proxy({
+    async call(value: number) { return await callback(value) },
+    dispose() { callback[releaseProxy]() },
+  })
+}
+
+export async function nestedCallbackValue(options: { callback: (value: number) => number }, value: number) {
+  return await options.callback(value)
+}
+
 export function transferBuffer(buffer: ArrayBuffer) {
   new Uint8Array(buffer)[0] += 1
   lastTransferred = buffer
@@ -44,6 +55,12 @@ export function roundTripCustom(value: CustomValue) {
   if (!(value instanceof CustomValue)) throw new TypeError('Custom transfer handler did not deserialize the argument')
   if (transferHandlers !== sharedHandlers) throw new Error('Public helpers loaded more than once')
   return new CustomValue(value.double())
+}
+
+export function customFunctionValue(callback: (value: number) => number, value: number) {
+  const result = callback(value)
+  if (typeof result !== 'number') throw new Error('Custom function handler did not deserialize a local function')
+  return result
 }
 
 // Both names have special meanings to Comlink's generic proxy. The plugin's

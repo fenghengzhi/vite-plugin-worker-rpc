@@ -5,7 +5,7 @@ import { dirname, isAbsolute, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createFilter, type FilterPattern } from '@rollup/pluginutils'
 import { normalizePath, type Plugin, type ResolvedConfig } from 'vite'
-import { collectRpcExports } from './exports.js'
+import { rewriteRpcImports } from './imports.js'
 import { parsePoolQuery, poolModuleId } from './pool-query.js'
 import type { RpcPoolMode } from './runtime.js'
 
@@ -35,11 +35,11 @@ function importPath(from: string, to: string): string {
 }
 
 /** Turn named function imports from *.rpc.ts / *.rpc.js into lazy Worker calls. */
-export default function workerRpc(options: WorkerRpcOptions = {}): Plugin {
+export default function workerRpc(options: WorkerRpcOptions = {}): Plugin[] {
   return createPlugin(options, false)
 }
 
-function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
+function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin[] {
   let matches: ReturnType<typeof createFilter>
   const defaultPool = options.pool === undefined ? 'auto' : options.pool
   if (defaultPool !== 'auto' && defaultPool !== 'unlimited' &&
@@ -62,7 +62,7 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
     return realpath(cache)
   }
 
-  return {
+  return [{
     name: 'vite-plugin-worker-rpc',
     enforce: 'pre',
     config(userConfig) {
@@ -75,7 +75,7 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
         worker: {
           // Worker builds have a separate plugin pipeline. Use a fresh instance
           // to normalize nested RPC queries while preserving user Worker plugins.
-          plugins: () => [createPlugin(options, true), ...(existingPlugins?.() ?? [])],
+          plugins: () => [...createPlugin(options, true), ...(existingPlugins?.() ?? [])],
         },
       }
     },
@@ -151,8 +151,6 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
       if (!matches(filename) || config.isWorker) return
       const pool = parsePoolQuery(id, defaultPool)
       if (pool === null) return
-      const names = collectRpcExports(code, filename)
-      if (!names.length) return { code: 'export {};', map: null }
       filename = await realpath(filename)
       const cache = await cacheDirectory()
       const hash = createHash('sha256').update(normalizePath(filename)).digest('hex').slice(0, 20)
@@ -167,12 +165,14 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
       workerFiles.add(normalizePath(filename))
       return {
         code: [
-          `import { createRpcClient } from ${jsString(normalizePath(runtime))};`,
+          `import { createRpcClient, createRpcModule, rpcModuleNamespace } from ${jsString(normalizePath(runtime))};`,
           'const rpc = createRpcClient(() => {',
           '  if (typeof Worker === "undefined") throw new Error("[vite-plugin-worker-rpc] RPC calls require a browser with Web Worker support. Calls during SSR are not supported.");',
           `  return new Worker(new URL(${jsString(importPath(filename, entry))}, import.meta.url), { type: "module" });`,
           `}, { timeoutMs: ${timeoutMs}, pool: ${JSON.stringify(pool)} });`,
-          ...names.map((name, index) => `const call${index} = (...args) => rpc.call(${jsString(name)}, args);\nexport { call${index} as ${jsString(name)} };`),
+          'const api = createRpcModule(rpc);',
+          'export default api;',
+          'export const __workerRpcNamespace = rpcModuleNamespace(api);',
           'if (import.meta.hot) import.meta.hot.dispose(() => rpc.dispose());',
         ].join('\n'),
         map: null,
@@ -187,5 +187,23 @@ function createPlugin(options: WorkerRpcOptions, workerBuild: boolean): Plugin {
         return []
       }
     },
-  }
+  }, {
+    name: 'vite-plugin-worker-rpc:imports',
+    // Framework plugins must first turn SFCs/MDX/etc. into JavaScript. Keep the
+    // main proxy generation early so Vite still bundles its Worker URL normally.
+    enforce: 'post',
+    async transform(code, id) {
+      if (config.isWorker || isSource(id) || matches(cleanId(id))) return
+      if (/\.(?:css|less|sass|scss|styl|stylus|svg|html)(?:\?|$)/i.test(id) &&
+          !new URLSearchParams(id.split('?')[1]).has('html-proxy')) return
+      // The import adapter examines consumers only, never RPC implementations.
+      if (!/\b(?:import|export)\b/.test(code)) return
+      return rewriteRpcImports(code, id, async source => {
+        const resolved = await this.resolve(source, id, { skipSelf: false })
+        if (!resolved || resolved.external || isSource(resolved.id)) return false
+        const filename = cleanId(resolved.id)
+        return isAbsolute(filename) && matches(filename) && parsePoolQuery(resolved.id, defaultPool) !== null
+      })
+    },
+  }]
 }

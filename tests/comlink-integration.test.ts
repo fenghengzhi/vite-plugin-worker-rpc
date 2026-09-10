@@ -19,7 +19,7 @@ async function closeHttpServer(server: PreviewServer['httpServer']): Promise<voi
   })
 }
 
-test('Comlink proxies, transfers, custom handlers, and reserved export names work with a Worker pool in dev and production', { timeout: 100_000 }, async (t) => {
+test('Automatic callbacks, Comlink proxies, transfers, custom handlers, and reserved export names work with a Worker pool in dev and production', { timeout: 100_000 }, async (t) => {
   const browser = await chromium.launch({
     headless: true,
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : {}),
@@ -84,8 +84,10 @@ test('Comlink proxies, transfers, custom handlers, and reserved export names wor
           const callbacks = await page.evaluate(() => (globalThis as any).comlinkApi.callbacks())
           assert.equal(callbacks.synchronous.value, 5)
           assert.equal(callbacks.asynchronous.value, 6)
+          assert.equal(callbacks.explicit.value, 7)
           assert.equal(callbacks.synchronous.released, true)
           assert.equal(callbacks.asynchronous.released, true)
+          assert.equal(callbacks.explicit.released, true)
           assert.deepEqual(callbacks.errors, [
             { name: 'TypeError', message: 'synchronous callback error' },
             { name: 'TypeError', message: 'asynchronous callback error' },
@@ -97,14 +99,25 @@ test('Comlink proxies, transfers, custom handlers, and reserved export names wor
           assert.ok(shared.results.every((result: { released: boolean }) => result.released))
           assert.equal(shared.reused.value, 30)
           assert.equal(shared.reused.released, true)
+          assert.equal(shared.originalUnchanged, true, 'passing a callback must not mark the original function')
           assert.equal(await page.evaluate(() => (globalThis as any).comlinkWorkerCount), 2)
+
+          assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.frozenCallback()), {
+            value: 42, released: true, originalUnchanged: true, originalValue: 8,
+          })
+          assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.retainedCallback()), {
+            values: [21, 22], first: 42, second: 44,
+          })
+          assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.nestedCallback()), {
+            name: 'DataCloneError',
+          })
 
           assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.buffers()), {
             senderLength: 0, workerLength: 0, received: [8, 8, 9], copied: [20, 21], copy: [21, 21],
           })
           assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.returnedFunction()), { value: 42, released: true })
           assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.customHandler()), {
-            helpersShareRegistry: true, isCustomValue: true, value: 12, doubled: 24,
+            helpersShareRegistry: true, isCustomValue: true, value: 12, doubled: 24, functionValue: 21,
           })
           assert.deepEqual(await page.evaluate(() => (globalThis as any).comlinkApi.specialExports()), [101, 202])
           assert.deepEqual(errors, [], 'proxy release and callback failures must not leak page errors')

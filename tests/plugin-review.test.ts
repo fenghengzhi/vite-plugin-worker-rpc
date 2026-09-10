@@ -19,7 +19,9 @@ test('dev serves worker entries from an external cacheDir without exposing its s
     configFile: false,
     logLevel: 'silent',
     plugins: [workerRpc()],
-    server: { middlewareMode: true, hmr: false },
+    // This filesystem-access test does not edit files. Disable watching so
+    // Vite 6/7 cannot retain late-starting watchers during concurrent teardown.
+    server: { middlewareMode: true, hmr: false, watch: null },
   })
   // Own the HTTP lifecycle so Vite does not attach CLI stdin listeners in this
   // Node test process. The same Vite filesystem middleware handles requests.

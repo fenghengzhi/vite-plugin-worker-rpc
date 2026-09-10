@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Dynamic RPC proxy architecture</title></head>
+  <body>
+    <script type="module" src="/main.ts"></script>
+    <script type="module">
+      import { calculate } from './compute.rpc?pool=1'
+      globalThis.inlineHtmlCalculate = calculate
+    </script>
+  </body>
+</html>

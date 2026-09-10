@@ -13,4 +13,12 @@ transferHandlers.set('worker-rpc-test-custom-value', {
   deserialize: (value: number) => new CustomValue(value),
 })
 
+// A registered function handler takes precedence over automatic callbacks.
+type CustomFunction = ((value: number) => number) & { multiplier: number }
+transferHandlers.set('worker-rpc-test-custom-function', {
+  canHandle: (value): value is CustomFunction => typeof value === 'function' && typeof (value as CustomFunction).multiplier === 'number',
+  serialize: (value: CustomFunction) => [value.multiplier, []],
+  deserialize: (multiplier: number) => Object.assign((value: number) => value * multiplier, { multiplier }),
+})
+
 export { transferHandlers as sharedHandlers }

@@ -4,6 +4,10 @@ import { add as automatic } from './compute.rpc?pool=auto'
 import { add as unlimited, greet } from './compute.rpc?pool=unlimited'
 import {
   applyCallback,
+  applyOptionalCallback,
+  applyNullableCallback,
+  applyCallbackOrValue,
+  useNestedCallback,
   readProxiedObject,
   createCounter,
   createMultiplier,
@@ -45,6 +49,27 @@ import { absent } from './compute.rpc?pool=auto'
 
 const callbackResult: number = await applyCallback(proxy((value: number) => value * 2), 3)
 const asyncCallbackResult: number = await applyCallback(proxy(async (value: number) => value * 2), 3)
+const automaticCallbackResult: number = await applyCallback((value) => {
+  type InferredCallbackValue = Expect<Equal<typeof value, number>>
+  return value * 2
+}, 3)
+const automaticAsyncCallbackResult: number = await applyCallback(async (value) => {
+  type InferredAsyncCallbackValue = Expect<Equal<typeof value, number>>
+  return value * 2
+}, 3)
+await applyOptionalCallback(3)
+await applyOptionalCallback(3, undefined)
+await applyOptionalCallback(3, (value) => {
+  type InferredOptionalCallbackValue = Expect<Equal<typeof value, number>>
+  return value * 2
+})
+await applyNullableCallback(3, null)
+await applyNullableCallback(3, async (value) => value * 2)
+await applyCallbackOrValue(3)
+await applyCallbackOrValue((value) => {
+  type InferredUnionCallbackValue = Expect<Equal<typeof value, number>>
+  return value * 2
+})
 const localObject = proxy({
   value: 1,
   increment(amount: number) {
@@ -53,16 +78,30 @@ const localObject = proxy({
   },
 })
 const objectResult: number = await readProxiedObject(localObject)
-void [callbackResult, asyncCallbackResult, objectResult]
+void [callbackResult, asyncCallbackResult, automaticCallbackResult, automaticAsyncCallbackResult, objectResult]
 
 // @ts-expect-error Proxied callback parameters retain their original types.
 applyCallback(proxy((value: string) => value.length), 3)
 // @ts-expect-error Proxied callback results retain their original types.
 applyCallback(proxy((value: number) => String(value)), 3)
-// @ts-expect-error Callback values must be explicitly marked for proxying.
-applyCallback((value: number) => value * 2, 3)
+// @ts-expect-error Automatic callback parameters retain their original types.
+applyCallback((value: string) => value.length, 3)
+// @ts-expect-error Automatic callback results retain their original types.
+applyCallback((value: number) => String(value), 3)
+// @ts-expect-error Automatic async callback results retain their original types.
+applyCallback(async (value: number) => String(value), 3)
+// @ts-expect-error Optional callbacks must retain their result types.
+applyOptionalCallback(3, (value) => String(value))
+// @ts-expect-error Nullable callbacks must retain their argument types.
+applyNullableCallback(3, (value: string) => value.length)
+// @ts-expect-error Callback unions must retain their result types.
+applyCallbackOrValue(async (value) => String(value))
 // @ts-expect-error Proxied object methods retain their original parameter types.
 readProxiedObject(proxy({ value: 1, increment(amount: string) { return amount.length } }))
+// @ts-expect-error Objects are not implicitly proxied, even if they have methods.
+readProxiedObject({ value: 1, increment(amount: number) { return amount } })
+// @ts-expect-error Nested callbacks are not implicitly proxied.
+useNestedCallback({ callback: (value: number) => value * 2 })
 
 const counter = await createCounter(1)
 type RemoteProperty = Expect<Equal<typeof counter.value, Promise<number>>>

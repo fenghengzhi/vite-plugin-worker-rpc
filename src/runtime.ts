@@ -1,4 +1,4 @@
-import { expose, releaseProxy, wrap, type Endpoint, type Remote } from 'comlink'
+import { expose, proxy, releaseProxy, transferHandlers, wrap, type Endpoint, type Remote } from 'comlink'
 
 /** The transport required by Comlink and the worker-side dispatcher. */
 export interface RpcEndpoint {
@@ -32,8 +32,57 @@ export interface RpcClient {
   dispose(): void
 }
 
+export type RpcModule = Record<string, (...args: unknown[]) => Promise<unknown>>
+
+/** Resolve exports lazily without loading or enumerating the worker implementation. */
+export function createRpcModule(client: RpcClient): RpcModule {
+  const methods = new Map<string, (...args: unknown[]) => Promise<unknown>>()
+  return new Proxy(Object.create(null) as RpcModule, {
+    get(_target, method) {
+      if (method === Symbol.toStringTag) return 'Module'
+      if (typeof method !== 'string') return undefined
+      let invoke = methods.get(method)
+      if (!invoke) {
+        invoke = (...args) => client.call(method, args)
+        methods.set(method, invoke)
+      }
+      return invoke
+    },
+    set() { return false },
+    defineProperty() { return false },
+    deleteProperty() { return false },
+  })
+}
+
+type RpcModuleNamespace = RpcModule & { readonly then: undefined }
+const moduleNamespaces = new WeakMap<RpcModule, RpcModuleNamespace>()
+
+/** Namespace/API values must not interpret an RPC export named then as a Promise hook. */
+export function rpcModuleNamespace(module: RpcModule): RpcModuleNamespace {
+  let namespace = moduleNamespaces.get(module)
+  if (!namespace) {
+    namespace = new Proxy(module, {
+      get(target, method, receiver) {
+        return method === 'then' ? undefined : Reflect.get(target, method, receiver)
+      },
+    }) as RpcModuleNamespace
+    moduleNamespaces.set(module, namespace)
+  }
+  return namespace
+}
+
 type Dispatch = (method: string, ...args: unknown[]) => unknown
 type MessageListener = (event: { data: unknown }) => void
+
+/** Automatically expose direct callback arguments without marking the user's function. */
+function prepareArgument(value: unknown): unknown {
+  if (typeof value !== 'function') return value
+  // Explicit proxies and custom transfer handlers retain their existing semantics.
+  for (const handler of transferHandlers.values()) {
+    if (handler.canHandle(value)) return value
+  }
+  return proxy((...args: unknown[]) => Reflect.apply(value, undefined, args))
+}
 
 /** Track only transport listeners; Comlink owns the entire message protocol. */
 function managedEndpoint(source: RpcEndpoint): { endpoint: Endpoint; close(): void } {
@@ -201,9 +250,10 @@ export function createRpcClient(
           if (takePending(call)) settle(value)
         }
         try {
-          // Keep arguments separate: Comlink's proxy/transfer handlers operate
-          // on each argument. The actual promise also tracks work after timeout.
-          Promise.resolve(selected.remote!(method, ...args)).then(
+          // Only direct callback arguments are automatic. Comlink retains control
+          // of serialization, remote references, and their release/GC lifecycle.
+          // The actual promise also tracks work after timeout.
+          Promise.resolve(selected.remote!(method, ...args.map(prepareArgument))).then(
             value => complete(resolve, value),
             error => complete(reject, error),
           )

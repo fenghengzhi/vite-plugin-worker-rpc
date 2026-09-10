@@ -19,6 +19,32 @@ export async function applyCallback(
   }
 }
 
+export async function applyOptionalCallback(
+  value: number,
+  callback?: RemoteProxy<(value: number) => number>,
+): Promise<number> {
+  return callback ? callback(value) : value
+}
+
+export async function applyNullableCallback(
+  value: number,
+  callback: RemoteProxy<(value: number) => number> | null,
+): Promise<number> {
+  return callback ? callback(value) : value
+}
+
+export async function applyCallbackOrValue(
+  callback: RemoteProxy<(value: number) => number> | number,
+): Promise<number> {
+  return typeof callback === 'number' ? callback : callback(2)
+}
+
+export async function useNestedCallback(
+  options: { callback: RemoteProxy<(value: number) => number> },
+): Promise<number> {
+  return options.callback(2)
+}
+
 export async function readProxiedObject(
   object: RemoteProxy<{ value: number; increment(amount: number): number }>,
 ): Promise<number> {

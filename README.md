@@ -114,7 +114,7 @@ const api = implementation as unknown as Remote<typeof implementation>
 const result = await api.add(1, 2)
 ```
 
-`Remote<T>` describes the generated module's exported functions using Comlink's argument and result mappings, including values marked with `proxy()`. It is a type helper, not an additional runtime wrapper. Use it for APIs with callback parameters or returned proxies too: `async` alone does not describe how these values change across threads. Unmarked arguments and results must be structured-cloneable.
+`Remote<T>` describes the generated module's exported functions using Comlink's argument and result mappings, accepting ordinary functions for direct callback parameters as well as values explicitly marked with `proxy()`. It is a type helper, not an additional runtime wrapper. Use it for APIs with callback parameters or returned proxies too: `async` alone does not describe how these values change across threads. Other unmarked arguments and results must be structured-cloneable.
 
 ### Query import declarations
 
@@ -143,7 +143,7 @@ The wildcard suffix must identify **one source module** across your TypeScript p
 
 ## Exports and execution
 
-Supported exports are locally declared named functions, function-valued variables, aliases of those functions, and type-only declarations:
+RPC implementations use normal ESM exports. Functions may be declared locally, assigned to variables, imported and re-exported, or re-exported from another module. Type-only declarations are allowed:
 
 ```ts
 export interface Input { value: number }
@@ -154,9 +154,49 @@ export async function double(input: Input) {
 
 const triple = async (value: number) => value * 3
 export { triple as multiplyByThree }
+
+export { add } from './math'
+export * from './more-functions'
 ```
 
-Default exports, exported runtime values/classes, generator functions, runtime re-exports, and `export *` are rejected with build errors. Wrap imported functions in a local exported function, and keep shared constants in a regular module. Unexported module state is allowed.
+The plugin does not enumerate or validate the implementation's exports at build time. The Worker looks up the requested name when a call arrives. Calling a missing export or a non-function rejects with a `TypeError`. Classes cannot be called as ordinary functions, and generator results are not structured-cloneable. Exported constants stay in the Worker; the browser proxy does not expose their values. Put constants needed by both threads in a regular shared module.
+
+### Import forms and generated modules
+
+Keep using named imports, including aliases, or a namespace import:
+
+```ts
+import { add as sum } from './compute.rpc'
+import * as compute from './compute.rpc'
+
+await sum(1, 2)
+await compute.add(1, 2)
+```
+
+The plugin generates a browser module with a dynamic `Proxy` and a Worker entry that imports the original implementation. Together with the original implementation, these are three logical modules; the final number of bundle files depends on Vite. The browser module also exports a fixed internal facade for dynamic imports. It does not generate one export per RPC function or change the implementation's function bodies.
+
+A separate transform rewrites consuming modules' imports into property accesses on the browser proxy. It reads the names requested by the consumer rather than scanning the RPC implementation's export list. The proxy resolves each method name lazily and sends it through the Worker pool. Direct function arguments are automatically proxied individually; the argument array itself is not a remote reference.
+
+Named re-exports and namespace re-exports from an application module are supported:
+
+```ts
+// src/api.ts
+export { add, multiplyByThree as triple } from './compute.rpc'
+export * as compute from './compute.rpc'
+```
+
+A consumer's `export * from './compute.rpc'` is rejected because it requires enumerating the RPC exports; list the names or use `export * as compute` instead. This restriction does not apply to re-exports inside the original Worker implementation, such as the `export * from './more-functions'` above.
+
+Consumer named imports and re-exports bind cached proxy methods to local variables; they are not native live bindings to the Worker exports. An eager call during cyclic consumer initialization can hit a temporal dead zone before those variables initialize, including cycles through imports or re-exports. Break the cycle or defer the call until the modules have initialized. Dependencies inside the original Worker implementation retain normal ESM semantics.
+
+Literal dynamic imports are also supported:
+
+```ts
+const compute = await import('./compute.rpc')
+await compute.add(1, 2)
+```
+
+Use a literal path; dynamic imports whose paths depend on runtime variables are not supported. Namespace/API objects from static or dynamic imports hide `then` so Promise resolution cannot accidentally call an RPC export. Use a named import such as `import { then as runThen } from './compute.rpc'` to call a function exported as `then`. Namespace proxies provide method access, not export discovery: do not use `Object.keys`, `for...in`, or `in` to enumerate or test for available exports. Pure type imports remain type-only and do not start Workers.
 
 Implementation imports execute in the Worker. A local RPC module reached from another RPC implementation is a normal local dependency of that Worker, even when its import includes `?pool=...`; it does not create a nested pool or RPC call. Dependencies must support the Worker environment: there is no `window` or DOM, and Node-only APIs are unavailable. Module initialization runs once in each Worker when it starts, not when the browser imports the proxy.
 
@@ -166,18 +206,14 @@ The browser-safe `vite-plugin-worker-rpc/client` entry exports Comlink's `proxy`
 
 ### Callback parameters
 
-Mark a callback with `proxy()`. It stays in the thread where it was created; the Worker calls it asynchronously and can await its return value or catch its exception.
+Pass a callback directly: the plugin automatically proxies function arguments. The callback stays in the thread where it was created; the Worker calls it asynchronously and can await its return value or catch its exception. Both synchronous and asynchronous callbacks are supported.
 
 ```ts
 // src/compute.rpc.ts
-import { releaseProxy, type RemoteProxy } from 'vite-plugin-worker-rpc/client'
+import type { RemoteProxy } from 'vite-plugin-worker-rpc/client'
 
 export async function calculate(value: number, callback: RemoteProxy<(n: number) => number>) {
-  try {
-    return await callback(value)
-  } finally {
-    callback[releaseProxy]() // This invocation has finished using this remote reference.
-  }
+  return await callback(value)
 }
 ```
 
@@ -185,13 +221,25 @@ export async function calculate(value: number, callback: RemoteProxy<(n: number)
 // src/main.ts
 import * as implementation from './compute.rpc'
 import type { Remote } from 'vite-plugin-worker-rpc'
-import { proxy } from 'vite-plugin-worker-rpc/client'
-
 const api = implementation as unknown as Remote<typeof implementation>
-const result = await api.calculate(21, proxy((n: number) => n * 2)) // 42
+const result = await api.calculate(21, n => n * 2) // 42; n is inferred as number.
 ```
 
-`RemoteProxy<T>` describes the receiver's asynchronous Comlink reference and preserves the proxy marker needed for parameter inference. `proxy()` marks the sender's original value; it does not turn that value into a remote reference locally. Call `[releaseProxy]()` on the received reference, after its last use. If several operations share a received reference, wait for all of them before releasing it. Sending the same original callback in multiple RPC calls creates an independent Comlink endpoint for each transmission, so each receiver releases its own reference without invalidating the other transmissions.
+`RemoteProxy<T>` describes the receiver's asynchronous Comlink reference. `Remote<T>` maps this parameter to an ordinary callback on the sending side. Automatic wrapping does not modify your function, so frozen callbacks work too. Explicit `proxy(fn)` remains supported, and functions already handled by a custom transfer handler retain that handler's behavior.
+
+Automatic wrapping applies only to direct arguments of the generated RPC exports. Functions inside objects or arrays, returned functions, and arguments to methods on returned Comlink references still require explicit handling. An automatic callback exposes its call behavior; use an explicit proxy when you need a function's attached properties. Bind methods before passing them if they need a specific `this` value.
+
+Modern browsers can reclaim a received callback through Comlink's `FinalizationRegistry` when it is no longer referenced. The example above can rely on that mechanism; collection is not immediate. The plugin does not release callbacks when the RPC call finishes, so a Worker can intentionally retain one for later use. For prompt cleanup, import `releaseProxy` in the Worker and release the received reference after its last use:
+
+```ts
+try {
+  return await callback(value)
+} finally {
+  callback[releaseProxy]()
+}
+```
+
+If several operations share a received reference, wait for all of them before releasing it. Sending the same original callback in multiple RPC calls creates an independent Comlink endpoint for each transmission, so each receiver releases its own reference without invalidating the other transmissions.
 
 ### Transfer ownership instead of copying
 
@@ -256,9 +304,9 @@ Keep the inferred `proxy()` return type, or explicitly preserve its proxy marker
 
 Comlink's `transferHandlers` can serialize additional value types. Register each handler under the **same name on both sides before the call**. For example, put the registration in a regular shared module, import `transferHandlers` from `vite-plugin-worker-rpc/client` there, and import that module from both the browser entry and the RPC implementation. See [Comlink's transfer handler API](https://github.com/GoogleChromeLabs/comlink#transfer-handlers-and-event-listeners) for the `canHandle`, `serialize`, and `deserialize` contract.
 
-Comlink processes direct arguments and direct return values; it does not recursively apply these helpers or handlers to nested properties. For example, `{ callback: proxy(fn) }` is not automatically a supported callback parameter: pass `proxy(fn)` as its own argument, proxy the containing object, or provide a handler for the containing value. DOM nodes and unmarked functions are not structured-cloneable.
+Comlink processes direct arguments and direct return values; it does not recursively apply these helpers or handlers to nested properties. For example, neither `{ callback: fn }` nor `{ callback: proxy(fn) }` is automatically a supported callback parameter: pass `fn` as its own argument, proxy the containing object, or provide a handler for the containing value. DOM nodes and unmarked functions outside the automatic direct-argument handling are not structured-cloneable.
 
-The application owns the lifetime of received callback and returned-object references. Release them after the last use, including error paths; garbage collection is not a deterministic cleanup mechanism. Stopping the pool cleans up the pool's Workers and its own transport resources. It does not guarantee cleanup of every callback channel or returned proxy held by application code. A timeout does not release those references or cancel computation.
+The application owns the lifetime of received callback and returned-object references. Modern browsers support Comlink's automatic reclamation of unreachable proxies; use explicit release after the last use, including error paths, when you need prompt cleanup. Stopping the pool cleans up the pool's Workers and its own transport resources. It does not guarantee cleanup of every callback channel or returned proxy held by application code. A timeout does not release those references or cancel computation.
 
 ## Options
 
@@ -295,7 +343,7 @@ export default defineConfig({
 ## Runtime behavior and limits
 
 - Calls always return Promises. Concurrent requests are matched to their own results; completion order can differ from call order. Pool scheduling does not guarantee that successive calls reach the same Worker.
-- Comlink serializes arguments and results using structured cloning by default. Use the client helpers above for explicit transfers, callback proxies, remote objects, or custom handlers.
+- Direct function arguments are automatically proxied; other arguments and results use Comlink's structured cloning by default. Use the client helpers above for explicit transfers, remote objects, returned functions, or custom handlers.
 - Comlink transports remote exceptions. Thrown `Error` objects preserve their name, message, and stack when available, but not custom properties or prototypes. Structured-cloneable non-`Error` thrown values remain non-`Error` values.
 - A timeout rejects the caller's Promise; it does **not** cancel the computation, which remains counted as unfinished until its response arrives. A fatal Worker transport failure stops the entire pool, rejects its pending calls, and makes its proxies unusable until the page is reloaded. An exception thrown by an exported function only rejects that call.
 - RPC modules may be imported during SSR. Calling their proxies without browser Worker support rejects; there is no server-side fallback.
@@ -319,7 +367,7 @@ npm run check
 npm run build:playground
 ```
 
-Tests cover export validation, RPC transport behavior, and actual Chromium Workers in Vite development and production, including a non-root base path and development reloads. CI runs against Vite 6, 7, and 8 on Node.js 22.
+Tests cover import rewriting, runtime export dispatch, RPC transport behavior, and actual Chromium Workers in Vite development and production, including a non-root base path and development reloads. CI runs against Vite 6, 7, and 8 on Node.js 22.
 
 ## Publishing releases
 

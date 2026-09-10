@@ -1,9 +1,86 @@
 import assert from 'node:assert/strict'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import { test } from 'node:test'
-import { createRpcClient, exposeRpc, type RpcClientOptions, type RpcEndpoint, type RpcWorker } from '../src/runtime.js'
+import { createRpcClient, createRpcModule, exposeRpc, rpcModuleNamespace, type RpcClient, type RpcClientOptions, type RpcEndpoint, type RpcWorker } from '../src/runtime.js'
 
 type Listener = (event: never) => void
+
+test('RPC module methods are lazy, stable, and forward names and arguments unchanged', async () => {
+  const calls: { method: string; args: unknown[] }[] = []
+  const client: RpcClient = {
+    async call(method, args) {
+      calls.push({ method, args })
+      return method
+    },
+    dispose() {},
+  }
+  const module = createRpcModule(client)
+  const calculate = module.calculate!
+  assert.equal(module.calculate, calculate)
+  assert.equal(calls.length, 0)
+  const callback = (value: number) => value * 2
+  assert.equal(await calculate(21, callback), 'calculate')
+  assert.equal(calls[0]!.args[1], callback)
+  assert.deepEqual(calls[0], { method: 'calculate', args: [21, callback] })
+
+  for (const method of ['then', 'bind', 'constructor', 'toString', '__proto__', 'default']) {
+    assert.equal(module[method], module[method])
+    assert.equal(await module[method]!(), method)
+  }
+  assert.deepEqual(calls.slice(1).map(call => call.method), ['then', 'bind', 'constructor', 'toString', '__proto__', 'default'])
+})
+
+test('RPC modules do not turn symbol inspection or mutation into remote calls', () => {
+  const module = createRpcModule({
+    call() { throw new Error('Property inspection must not dispatch an RPC.') },
+    dispose() {},
+  })
+  assert.equal(Object.getPrototypeOf(module), null)
+  assert.equal(Object.prototype.toString.call(module), '[object Module]')
+  assert.equal(Reflect.get(module, Symbol.iterator), undefined)
+  assert.equal(Reflect.get(module, Symbol.asyncIterator), undefined)
+  assert.equal(Reflect.get(module, Symbol('custom')), undefined)
+  assert.deepEqual(Reflect.ownKeys(module), [])
+  assert.equal(Reflect.set(module, 'calculate', () => 0), false)
+  assert.equal(Reflect.defineProperty(module, 'calculate', { value: () => 0 }), false)
+  assert.equal(Reflect.deleteProperty(module, 'calculate'), false)
+})
+
+test('cached RPC module methods preserve the owning client disposal behavior', async () => {
+  let disposed = false
+  const failure = new Error('client disposed')
+  const client: RpcClient = {
+    call() { return disposed ? Promise.reject(failure) : Promise.resolve(42) },
+    dispose() { disposed = true },
+  }
+  const module = createRpcModule(client)
+  const calculate = module.calculate!
+  assert.equal(await calculate(), 42)
+  client.dispose()
+  assert.equal(module.calculate, calculate)
+  await assert.rejects(calculate(), error => error === failure)
+})
+
+test('dynamic RPC namespace avoids Promise assimilation while sharing method identities', async () => {
+  const calls: string[] = []
+  const module = createRpcModule({
+    async call(method) {
+      calls.push(method)
+      return method
+    },
+    dispose() {},
+  })
+  const namespace = rpcModuleNamespace(module)
+  assert.equal(rpcModuleNamespace(module), namespace)
+  assert.equal(namespace.then, undefined)
+  assert.equal(await Promise.resolve(namespace), namespace)
+  assert.deepEqual(calls, [])
+  assert.equal(namespace.calculate, module.calculate)
+  assert.equal(namespace.default, module.default)
+  assert.equal(await namespace.calculate!(), 'calculate')
+  assert.equal(await module.then!(), 'then')
+  assert.deepEqual(calls, ['calculate', 'then'])
+})
 
 class FakePort {
   peer?: FakePort
@@ -202,7 +279,7 @@ test('rejects missing, inherited, and non-function exports', async () => {
 
 test('clone failures reject one call while subsequent calls still work', async () => {
   const context = pair({ echo: (value: unknown) => value, badResult: () => () => 1 })
-  await assert.rejects(context.client.call('echo', [() => 1]), { name: 'DataCloneError' })
+  await assert.rejects(context.client.call('echo', [{ callback: () => 1 }]), { name: 'DataCloneError' })
   await assert.rejects(context.client.call('badResult', []), { name: 'TypeError', message: 'Unserializable return value' })
   const original = { date: new Date(0), map: new Map([['answer', 42]]) }
   const result = await context.client.call('echo', [original])
@@ -428,7 +505,7 @@ test('timeouts retain actual worker occupancy until a late result arrives', asyn
 
 test('argument clone errors release pool occupancy immediately', async () => {
   const context = poolContext({ pool: 'unlimited' })
-  await assert.rejects(context.client.call('echo', [() => 1]), { name: 'DataCloneError' })
+  await assert.rejects(context.client.call('echo', [{ callback: () => 1 }]), { name: 'DataCloneError' })
   assert.equal(await context.client.call('echo', [42]), 42)
   assert.equal(context.workers.length, 1)
   context.client.dispose()
